@@ -1325,19 +1325,6 @@ async def health_check():
             "error": str(e)
         }
 
-@app.get("/v1/debug/routes")
-async def debug_routes():
-    """Debug endpoint to list all registered routes"""
-    routes = []
-    for route in app.routes:
-        if hasattr(route, 'methods') and hasattr(route, 'path'):
-            routes.append({
-                "path": route.path,
-                "methods": list(route.methods),
-                "name": route.name
-            })
-    return {"routes": routes}
-
 @app.get("/v1/models")
 async def list_models():
     models = get_models()
@@ -1358,7 +1345,7 @@ async def list_models():
         ]
     }
 
-@app.post("/v1/chat/completions", status_code=200)
+@app.post("/v1/chat/completions")
 async def api_chat_completions(request: Request, api_key: dict = Depends(rate_limit_api_key)):
     debug_print("\n" + "="*80)
     debug_print("🔵 NEW API REQUEST RECEIVED")
@@ -1370,10 +1357,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             body = await request.json()
         except json.JSONDecodeError as e:
             debug_print(f"❌ Invalid JSON in request body: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid JSON in request body: {str(e)}")
+            raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
         except Exception as e:
             debug_print(f"❌ Failed to read request body: {e}")
-            raise HTTPException(status_code=400, detail=f"Failed to read request body: {str(e)}")
+            raise HTTPException(status_code=400, detail="Failed to read request body.")
         
         debug_print(f"📥 Request body keys: {list(body.keys())}")
         
@@ -1501,7 +1488,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             debug_print(f"❌ Failed to process message content: {e}")
             raise HTTPException(
                 status_code=400,
-                detail=f"Failed to process message content: {str(e)}"
+                detail=f"Failed to process message content."
             )
         
         # Validate prompt
@@ -1703,7 +1690,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         print(f"❌ {error_msg}")
                         error_chunk = {
                             "error": {
-                                "message": str(e),
+                                "message": "Generation failed. Check if you have prefills enabled or try again in a new chat.",
                                 "type": "api_error",
                                 "code": e.response.status_code
                             }
@@ -1713,7 +1700,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         print(f"❌ Stream error: {str(e)}")
                         error_chunk = {
                             "error": {
-                                "message": str(e),
+                                "message": "Generation failed. Check if you have prefills enabled or try again in a new chat.",
                                 "type": "internal_error"
                             }
                         }
@@ -1892,7 +1879,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 error_type = "rate_limit_error" if e.response.status_code == 429 else "upstream_error"
                 return {
                     "error": {
-                        "message": error_detail,
+                        "message": "The API is overloaded at the moment. Try again later.",
                         "type": error_type,
                         "code": f"http_{e.response.status_code}"
                     }
@@ -1921,7 +1908,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 # Return OpenAI-compatible error response
                 return {
                     "error": {
-                        "message": f"Unexpected error: {str(e)}",
+                        "message": "Unexpected error in HTTP Client.}",
                         "type": "internal_error",
                         "code": type(e).__name__.lower()
                     }
@@ -1934,7 +1921,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         print(f"📛 Error type: {type(e).__name__}")
         print(f"📛 Error message: {str(e)}")
         print("="*80 + "\n")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 if __name__ == "__main__":
     print("=" * 60)
