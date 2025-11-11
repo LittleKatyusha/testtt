@@ -1440,50 +1440,22 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             # Don't fail the request if usage logging fails
             debug_print(f"⚠️  Failed to log usage stats: {e}")
 
-        # Build conversation history including system, user, and assistant messages
-        conversation_history = []
+        # Extract system prompt if present and prepend to first user message
         system_prompt = ""
-
-        # Extract system messages first
         system_messages = [m for m in messages if m.get("role") == "system"]
         if system_messages:
             system_prompt = "\n\n".join([m.get("content", "") for m in system_messages])
             debug_print(f"📋 System prompt found: {system_prompt[:100]}..." if len(system_prompt) > 100 else f"📋 System prompt: {system_prompt}")
-
-        # Build conversation history from user and assistant messages
-        for msg in messages:
-            role = msg.get("role")
-            content = msg.get("content", "")
-    
-            if role == "user":
-                conversation_history.append(f"User: {content}")
-            elif role == "assistant":
-                conversation_history.append(f"Char: {content}")
-
-        debug_print(f"💬 Conversation history entries: {len(conversation_history)}")
-
+        
         # Process last message content (may include images)
         try:
             last_message_content = messages[-1].get("content", "")
             prompt, experimental_attachments = await process_message_content(last_message_content, model_capabilities)
-    
-            # Build final prompt: System + History (except last user message) + Current prompt
-            final_prompt_parts = []
-    
+            
+            # If there's a system prompt and this is the first user message, prepend it
             if system_prompt:
-                final_prompt_parts.append(system_prompt)
-    
-            # Add all conversation history except the last user message (which is in prompt)
-            if len(conversation_history) > 1:
-                # Remove last entry since it's the current user message
-                final_prompt_parts.append("\n\n".join(conversation_history[:-1]))
-    
-            # Add current user message
-            final_prompt_parts.append(f"User: {prompt}")
-    
-            prompt = "\n\n".join(final_prompt_parts)
-            debug_print(f"✅ Built conversation with {len(conversation_history)} history entries")
-    
+                prompt = f"{system_prompt}\n\n{prompt}"
+                debug_print(f"✅ System prompt prepended to user message")
         except Exception as e:
             debug_print(f"❌ Failed to process message content: {e}")
             raise HTTPException(
@@ -1514,10 +1486,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Use API key + conversation tracking
         api_key_str = api_key["key"]
         
-        # Generate unique conversation ID for each request (no session continuation)
+        # Generate conversation ID from context (API key + model + first user message)
+        # This allows automatic session continuation without client modifications
         import hashlib
-        import time
-        conversation_key = f"{api_key_str}_{model_public_name}_{time.time()}_{uuid.uuid4()}"
+        first_user_message = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+        if isinstance(first_user_message, list):
+            # Handle array content format
+            first_user_message = str(first_user_message)
+        conversation_key = f"{api_key_str}_{model_public_name}_{first_user_message[:100]}"
         conversation_id = hashlib.sha256(conversation_key.encode()).hexdigest()[:16]
         
         debug_print(f"🔑 API Key: {api_key_str[:20]}...")
