@@ -25,7 +25,7 @@ import httpx
 DEBUG = False
 
 # Port to run the server on
-PORT = 8081
+PORT = 5102
 # ============================================================
 
 def debug_print(*args, **kwargs):
