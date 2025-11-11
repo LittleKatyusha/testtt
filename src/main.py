@@ -1325,6 +1325,19 @@ async def health_check():
             "error": str(e)
         }
 
+@app.get("/v1/debug/routes")
+async def debug_routes():
+    """Debug endpoint to list all registered routes"""
+    routes = []
+    for route in app.routes:
+        if hasattr(route, 'methods') and hasattr(route, 'path'):
+            routes.append({
+                "path": route.path,
+                "methods": list(route.methods),
+                "name": route.name
+            })
+    return {"routes": routes}
+
 @app.get("/v1/models")
 async def list_models():
     models = get_models()
@@ -1345,7 +1358,7 @@ async def list_models():
         ]
     }
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", status_code=200)
 async def api_chat_completions(request: Request, api_key: dict = Depends(rate_limit_api_key)):
     debug_print("\n" + "="*80)
     debug_print("🔵 NEW API REQUEST RECEIVED")
