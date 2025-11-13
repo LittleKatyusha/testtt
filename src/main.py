@@ -669,6 +669,27 @@ async def dashboard(session: str = Depends(get_current_session)):
             </tr>
         """
 
+    # Render Auth Tokens
+    auth_tokens = config.get("auth_tokens", [])
+    tokens_html = ""
+    if auth_tokens:
+        for idx, token in enumerate(auth_tokens):
+            token_preview = f"{token[:20]}...{token[-10:]}" if len(token) > 30 else token
+            tokens_html += f"""
+                <tr>
+                    <td><strong>Token {idx + 1}</strong></td>
+                    <td><code class="api-key-code">{token_preview}</code></td>
+                    <td>
+                        <form action='/delete-token' method='post' style='margin:0;' onsubmit='return confirm("Delete this auth token?");'>
+                            <input type='hidden' name='token_index' value='{idx}'>
+                            <button type='submit' class='btn-delete'>Delete</button>
+                        </form>
+                    </td>
+                </tr>
+            """
+    else:
+        tokens_html = '<tr><td colspan="3" class="no-data">No auth tokens configured</td></tr>'
+
     # Render Models (limit to first 20 with text output)
     text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
     models_html = ""
@@ -1016,15 +1037,30 @@ async def dashboard(session: str = Depends(get_current_session)):
                 <div class="section">
                     <div class="section-header">
                         <h2>🔐 Arena Authentication</h2>
-                        <span class="status-badge {token_class}">{token_status}</span>
+                        <span class="status-badge {token_class}">{len(auth_tokens)} Token(s)</span>
                     </div>
+                    
+                    <table style="margin-bottom: 20px;">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Token</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {tokens_html}
+                        </tbody>
+                    </table>
+                    
+                    <h3 style="margin-top: 30px; margin-bottom: 15px; font-size: 18px;">Add New Tokens</h3>
                     <form action="/update-auth-tokens" method="post">
                         <div class="form-group">
                             <label for="auth_tokens">Arena Auth Tokens (one per line)</label>
-                            <textarea id="auth_tokens" name="auth_tokens" placeholder="Paste your arena-auth-prod-v1 tokens here (one per line)" rows="8">{"&#10;".join(config.get("auth_tokens", []))}</textarea>
+                            <textarea id="auth_tokens" name="auth_tokens" placeholder="Paste your arena-auth-prod-v1 tokens here (one per line)" rows="8"></textarea>
                             <small>Add multiple tokens to distribute requests and avoid rate limits</small>
                         </div>
-                        <button type="submit">Update Tokens</button>
+                        <button type="submit">Add Tokens</button>
                     </form>
                 </div>
 
@@ -1236,15 +1272,6 @@ async def dashboard(session: str = Depends(get_current_session)):
         </html>
     """
 
-@app.post("/update-auth-token")
-async def update_auth_token(session: str = Depends(get_current_session), auth_token: str = Form(...)):
-    if not session:
-        return RedirectResponse(url="/login")
-    config = get_config()
-    config["auth_token"] = auth_token.strip()
-    save_config(config)
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-
 @app.post("/update-auth-tokens")
 async def update_auth_tokens(request: Request, auth_tokens: str = Form(...)):
     session = await get_current_session(request)
@@ -1254,12 +1281,34 @@ async def update_auth_tokens(request: Request, auth_tokens: str = Form(...)):
     config = get_config()
     
     # Split by newlines and filter out empty lines
-    tokens = [t.strip() for t in auth_tokens.split('\n') if t.strip()]
+    new_tokens = [t.strip() for t in auth_tokens.split('\n') if t.strip()]
     
-    config["auth_tokens"] = tokens
+    # Append new tokens to existing ones (avoid duplicates)
+    existing_tokens = config.get("auth_tokens", [])
+    for token in new_tokens:
+        if token not in existing_tokens:
+            existing_tokens.append(token)
+    
+    config["auth_tokens"] = existing_tokens
     save_config(config)
     
     return RedirectResponse(url="/dashboard?success=tokens_updated", status_code=303)
+
+@app.post("/delete-token")
+async def delete_token(session: str = Depends(get_current_session), token_index: int = Form(...)):
+    if not session:
+        return RedirectResponse(url="/login")
+    config = get_config()
+    auth_tokens = config.get("auth_tokens", [])
+    
+    # Validate index
+    if 0 <= token_index < len(auth_tokens):
+        deleted_token = auth_tokens.pop(token_index)
+        config["auth_tokens"] = auth_tokens
+        save_config(config)
+        debug_print(f"🗑️ Deleted auth token at index {token_index}: {deleted_token[:20]}...")
+    
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/create-key")
 async def create_key(session: str = Depends(get_current_session), name: str = Form(...), rpm: int = Form(...)):
@@ -1527,60 +1576,32 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         headers = get_request_headers()
         debug_print(f"📋 Headers prepared (auth token length: {len(headers.get('Cookie', '').split('arena-auth-prod-v1=')[-1].split(';')[0])} chars)")
         
-        # Check if conversation exists for this API key
-        session = chat_sessions[api_key_str].get(conversation_id)
-        
-        if not session:
-            debug_print("🆕 Creating NEW conversation session")
-            # New conversation - Generate all IDs at once (like the browser does)
-            session_id = str(uuid7())
-            user_msg_id = str(uuid7())
-            model_msg_id = str(uuid7())
+        debug_print("🆕 Creating NEW conversation session")
+        # New conversation - Generate all IDs at once (like the browser does)
+        session_id = str(uuid7())
+        user_msg_id = str(uuid7())
+        model_msg_id = str(uuid7())
             
-            debug_print(f"🔑 Generated session_id: {session_id}")
-            debug_print(f"👤 Generated user_msg_id: {user_msg_id}")
-            debug_print(f"🤖 Generated model_msg_id: {model_msg_id}")
+        debug_print(f"🔑 Generated session_id: {session_id}")
+        debug_print(f"👤 Generated user_msg_id: {user_msg_id}")
+        debug_print(f"🤖 Generated model_msg_id: {model_msg_id}")
             
-            payload = {
-                "id": session_id,
-                "mode": "direct",
-                "modelAId": model_id,
-                "userMessageId": user_msg_id,
-                "modelAMessageId": model_msg_id,
-                "userMessage": {
-                    "content": prompt,
-                    "experimental_attachments": experimental_attachments
-                },
-                "modality": "chat"
-            }
-            url = "https://lmarena.ai/nextjs-api/stream/create-evaluation"
-            debug_print(f"📤 Target URL: {url}")
-            debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
-        else:
-            debug_print("🔄 Using EXISTING conversation session")
-            # Follow-up message - Generate new message IDs
-            user_msg_id = str(uuid7())
-            debug_print(f"👤 Generated followup user_msg_id: {user_msg_id}")
-            model_msg_id = str(uuid7())
-            debug_print(f"🤖 Generated followup model_msg_id: {model_msg_id}")
-            
-            payload = {
-                "id": session["conversation_id"],
-                "mode": "direct",
-                "modelAId": model_id,
-                "userMessageId": user_msg_id,
-                "modelAMessageId": model_msg_id,
-                "userMessage": {
-                    "content": prompt,
-                    "experimental_attachments": experimental_attachments
-                },
-                "modality": "chat"
-            }
-            url = f"https://lmarena.ai/nextjs-api/stream/post-to-evaluation/{session['conversation_id']}"
-            debug_print(f"📤 Target URL: {url}")
-            debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f" Full payload: {json.dumps(payload, indent=2)}")
+        payload = {
+            "id": session_id,
+            "mode": "direct",
+            "modelAId": model_id,
+            "userMessageId": user_msg_id,
+            "modelAMessageId": model_msg_id,
+            "userMessage": {
+                "content": prompt,
+                "experimental_attachments": experimental_attachments
+            },
+            "modality": "chat"
+        }
+        url = "https://lmarena.ai/nextjs-api/stream/create-evaluation"
+        debug_print(f"📤 Target URL: {url}")
+        debug_print(f"📦 Payload structure: Simple userMessage format")
+        debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
 
         debug_print(f"\n🚀 Making API request to LMArena...")
         debug_print(f"⏱️  Timeout set to: 120 seconds")
@@ -1688,9 +1709,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     except httpx.HTTPStatusError as e:
                         error_msg = f"Proxy API error: {e.response.status_code}"
                         print(f"❌ {error_msg}")
+                        if e.response.status_code == 401:
+                            error_message= "Generation failed. Either the token is overloaded or you've encountered a filter. Try swiping. (Or you can just DM norenaboi)"
+                        else:
+                            error_message= ". You might have encountered a filter. Use a JB/CoT if you're not or try again in a new chat."
                         error_chunk = {
                             "error": {
-                                "message": "Generation failed. Check if you have prefills enabled or try again in a new chat.",
+                                "message": error_message,
                                 "type": "api_error",
                                 "code": e.response.status_code
                             }
@@ -1698,9 +1723,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield f"data: {json.dumps(error_chunk)}\n\n"
                     except Exception as e:
                         print(f"❌ Stream error: {str(e)}")
+                        if e.response.status_code == 401:
+                            error_message= "The token is overloaded. Try swiping. (Or you can just DM norenaboi)"
+                        else:
+                            error_message= "Generation failed. You might have encountered a filter. Use a JB/CoT if you're not or try again in a new chat."
                         error_chunk = {
                             "error": {
-                                "message": "Generation failed. Check if you have prefills enabled or try again in a new chat.",
+                                "message": error_message,
                                 "type": "internal_error"
                             }
                         }
