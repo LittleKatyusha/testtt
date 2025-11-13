@@ -1683,7 +1683,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         continue
                             
                             # Update session - Store message history with IDs
-                            if not session:
+                            if conversation_id not in chat_sessions[api_key_str]:
                                 chat_sessions[api_key_str][conversation_id] = {
                                     "conversation_id": session_id,
                                     "model": model_public_name,
@@ -1723,10 +1723,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield f"data: {json.dumps(error_chunk)}\n\n"
                     except Exception as e:
                         print(f"❌ Stream error: {str(e)}")
-                        if e.response.status_code == 401:
-                            error_message= "The token is overloaded. Try swiping. (Or you can just DM norenaboi)"
-                        else:
-                            error_message= "Generation failed. You might have encountered a filter. Use a JB/CoT if you're not or try again in a new chat."
+                        # Generic error message for non-HTTP errors
+                        error_message = "Generation failed. You might have encountered a filter. Use a JB/CoT if you're not or try again in a new chat."
                         error_chunk = {
                             "error": {
                                 "message": error_message,
@@ -1844,7 +1842,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     debug_print(f"✅ Response text preview: {response_text[:200]}...")
                 
                 # Update session - Store message history with IDs
-                if not session:
+                if conversation_id not in chat_sessions[api_key_str]:
                     chat_sessions[api_key_str][conversation_id] = {
                         "conversation_id": session_id,
                         "model": model_public_name,
