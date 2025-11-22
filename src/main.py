@@ -6,10 +6,12 @@ import time
 import secrets
 import base64
 import mimetypes
+import random
 from collections import defaultdict
 from typing import Optional, Dict, List
 from datetime import datetime, timezone, timedelta
 
+from platformdirs import user_data_dir
 import uvicorn
 from camoufox.async_api import AsyncCamoufox
 from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Response
@@ -437,11 +439,53 @@ async def get_initial_data():
 
             print("Waiting for Cloudflare challenge to complete...")
             try:
+                # Wait a bit for the challenge to load
+                await asyncio.sleep(3 + random.random())
+        
+                # Look for Cloudflare Turnstile checkbox/widget
+                turnstile_selectors = [
+                    'iframe[src*="challenges.cloudflare.com"]',
+                    'input[type="checkbox"]',
+                    '.cf-turnstile',
+                    '#cf-turnstile'
+                ]
+        
+                for selector in turnstile_selectors:
+                    try:
+                        element = await page.query_selector(selector)
+                        if element:
+                            print(f"✅ Found Turnstile element: {selector}")
+                    
+                            # If it's an iframe, switch to it and click inside
+                            if 'iframe' in selector:
+                                frame = await element.content_frame()
+                                if frame:
+                                    # Wait a bit to simulate human behavior
+                                    await asyncio.sleep(1 + random.random())
+                            
+                                    # Try to find and click the checkbox inside iframe
+                                    checkbox = await frame.query_selector('input[type="checkbox"], .cb-lb')
+                                    if checkbox:
+                                        await checkbox.click()
+                                        print("🖱️ Clicked Turnstile checkbox")
+                            else:
+                                # Direct element click with human-like delay
+                                await asyncio.sleep(1 + random.random())
+                                await element.click()
+                                print("🖱️ Clicked Turnstile element")
+                    
+                            break
+                    except Exception as e:
+                        continue
+        
+                # Now wait for challenge to complete
                 await page.wait_for_function(
                     "() => document.title.indexOf('Just a moment...') === -1", 
                     timeout=45000
                 )
                 print("✅ Cloudflare challenge passed.")
+        
+                await asyncio.sleep(4 + random.random())
             except Exception as e:
                 print(f"❌ Cloudflare challenge took too long or failed: {e}")
                 return
@@ -1554,7 +1598,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         
         # Check for reasonable character limit (LMArena appears to have limits)
         # Typical limit seems to be around 32K-64K characters based on testing
+<<<<<<< HEAD
         MAX_PROMPT_LENGTH = 200000  # Conservative estimate
+=======
+        MAX_PROMPT_LENGTH = 113567  # User hardcoded limit
+>>>>>>> 88314132c108d6ffdd51888d4187d845ca1e3d40
         if len(prompt) > MAX_PROMPT_LENGTH:
             error_msg = f"Limit or lower your context size under 35k broski."
             debug_print(f"❌ {error_msg}")
@@ -1681,28 +1729,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         yield f"data: {json.dumps(final_chunk)}\n\n"
                                     except json.JSONDecodeError:
                                         continue
-                            
-                            # Update session - Store message history with IDs
-                            if conversation_id not in chat_sessions[api_key_str]:
-                                chat_sessions[api_key_str][conversation_id] = {
-                                    "conversation_id": session_id,
-                                    "model": model_public_name,
-                                    "messages": [
-                                        {"id": user_msg_id, "role": "user", "content": prompt},
-                                        {"id": model_msg_id, "role": "assistant", "content": response_text.strip()}
-                                    ]
-                                }
-                                debug_print(f"💾 Saved new session for conversation {conversation_id}")
-                            else:
-                                # Append new messages to history
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    {"id": user_msg_id, "role": "user", "content": prompt}
-                                )
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    {"id": model_msg_id, "role": "assistant", "content": response_text.strip()}
-                                )
-                                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
-                            
                             yield "data: [DONE]\n\n"
                             debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
                             
@@ -1712,7 +1738,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         if e.response.status_code == 401:
                             error_message= "Generation failed. Either the token is overloaded or you've encountered a filter. Try swiping. (Or you can just DM norenaboi)"
                         else:
-                            error_message= ". You might have encountered a filter. Use a JB/CoT if you're not or try again in a new chat."
+                            error_message= str(e)
                         error_chunk = {
                             "error": {
                                 "message": error_message,
@@ -1723,8 +1749,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield f"data: {json.dumps(error_chunk)}\n\n"
                     except Exception as e:
                         print(f"❌ Stream error: {str(e)}")
-                        # Generic error message for non-HTTP errors
-                        error_message = "Generation failed. You might have encountered a filter. Use a JB/CoT if you're not or try again in a new chat."
+                        if e.response.status_code == 401:
+                            error_message= "The token is overloaded. Try swiping. (Or you can just DM norenaboi)"
+                        else:
+                            error_message= "Generation failed. You might have encountered a filter. Use a JB/CoT if you're not or try again in a new chat."
                         error_chunk = {
                             "error": {
                                 "message": error_message,
@@ -1842,7 +1870,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     debug_print(f"✅ Response text preview: {response_text[:200]}...")
                 
                 # Update session - Store message history with IDs
-                if conversation_id not in chat_sessions[api_key_str]:
+                if not session:
                     chat_sessions[api_key_str][conversation_id] = {
                         "conversation_id": session_id,
                         "model": model_public_name,
