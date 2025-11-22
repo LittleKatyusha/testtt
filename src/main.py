@@ -1598,11 +1598,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         
         # Check for reasonable character limit (LMArena appears to have limits)
         # Typical limit seems to be around 32K-64K characters based on testing
-<<<<<<< HEAD
         MAX_PROMPT_LENGTH = 200000  # Conservative estimate
-=======
-        MAX_PROMPT_LENGTH = 113567  # User hardcoded limit
->>>>>>> 88314132c108d6ffdd51888d4187d845ca1e3d40
         if len(prompt) > MAX_PROMPT_LENGTH:
             error_msg = f"Limit or lower your context size under 35k broski."
             debug_print(f"❌ {error_msg}")
