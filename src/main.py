@@ -1758,14 +1758,14 @@ async def refresh_recaptcha_token():
         # Look for 'grecaptcha.execute("SITE_KEY"' or similar
         # Or just try to execute grecaptcha if it's loaded
         
-        # 1. Check if grecaptcha is defined (wait for it)
+        # 1. Check if grecaptcha is defined (wait for it) - OPTIMIZED: Reduced wait time
         is_grecaptcha = False
         print("   Waiting for grecaptcha to load...")
-        for i in range(20):
+        for i in range(10):  # Reduced from 20 to 10 seconds
             is_grecaptcha = await page.evaluate("typeof grecaptcha !== 'undefined' || typeof window.grecaptcha !== 'undefined'")
             if is_grecaptcha:
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced from 1s to 0.5s
         
         if is_grecaptcha:
             print("✅ grecaptcha is defined on the page.")
@@ -1827,6 +1827,7 @@ async def refresh_recaptcha_token():
                     print(f"✅ Generated reCAPTCHA token: {token[:20]}...")
                     config = get_config()
                     config["recaptcha_token"] = token
+                    config["recaptcha_last_refresh"] = time.time()
                     save_config(config)
                     return token
                 else:
@@ -1935,19 +1936,20 @@ async def refresh_recaptcha_token():
                     }}
                 """)
                 
-                # 4. Wait for the token to appear in the input
+                # 4. Wait for the token to appear in the input - OPTIMIZED
                 print("   Waiting for token in hidden input...")
                 token = None
-                for _ in range(60): # Wait up to 60 seconds
+                for _ in range(30):  # Reduced from 60 to 30 seconds
                     token = await page.evaluate("document.getElementById('recaptcha-token-output').value")
                     if token:
                         break
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)  # Reduced from 1s to 0.5s
                 
                 if token and not token.startswith("ERROR"):
                     print(f"✅ Generated reCAPTCHA token via DOM bridge: {token[:20]}...")
                     config = get_config()
                     config["recaptcha_token"] = token
+                    config["recaptcha_last_refresh"] = time.time()
                     save_config(config)
                     return token
                 else:
@@ -1969,12 +1971,21 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
     active_generations += 1
     should_decrement = True
     try:
-        # Generate fresh reCAPTCHA token for this request
-        debug_print("🔄 Generating fresh reCAPTCHA token for this request...")
-        await refresh_recaptcha_token()
-
-        # Load config to ensure we have the latest token and it's available for later use
+        # OPTIMIZATION: Only refresh token if not recently generated or missing
         config = get_config()
+        recaptcha_token = config.get("recaptcha_token")
+        last_refresh = config.get("recaptcha_last_refresh", 0)
+        current_time = time.time()
+        
+        # Refresh only if token is missing or older than 60 seconds
+        if not recaptcha_token or (current_time - last_refresh) > 60:
+            debug_print("🔄 Generating fresh reCAPTCHA token...")
+            await refresh_recaptcha_token()
+            config = get_config()
+            config["recaptcha_last_refresh"] = current_time
+            save_config(config)
+        else:
+            debug_print(f"♻️ Reusing cached reCAPTCHA token (age: {int(current_time - last_refresh)}s)")
 
         debug_print("\n" + "="*80)
         debug_print("🔵 NEW API REQUEST RECEIVED")
