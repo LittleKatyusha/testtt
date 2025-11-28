@@ -1723,7 +1723,7 @@ async def list_models():
             "id": model_name,
             "object": "model",
             "created": int(asyncio.get_event_loop().time()),
-            "owned_by": "norenaboi",
+            "owned_by": "VVV",
             "type": "chat"  # Default type since we only have model names
         })
     
