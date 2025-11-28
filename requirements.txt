@@ -3,3 +3,7 @@ uvicorn
 camoufox
 playwright
 httpx
+tiktoken
+curl_cffi
+platformdirs
+pydantic
