@@ -2156,7 +2156,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         
         # Generate unique conversation ID for each request (no session continuation)
         import hashlib
-        import time
         conversation_key = f"{api_key_str}_{model_public_name}_{time.time()}_{uuid.uuid4()}"
         conversation_id = hashlib.sha256(conversation_key.encode()).hexdigest()[:16]
         
