@@ -9,7 +9,7 @@ import mimetypes
 import random
 import traceback
 from collections import defaultdict
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timezone, timedelta
 
 from platformdirs import user_data_dir
@@ -20,7 +20,9 @@ from starlette.responses import HTMLResponse, RedirectResponse, StreamingRespons
 from fastapi.security import APIKeyHeader
 
 import httpx
+import tiktoken
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import HTTPError, Timeout, RequestException as RequestsError
 
 # ============================================================
 # CONFIGURATION
@@ -32,7 +34,16 @@ DEBUG = False
 PORT = 8081
 
 # Chunk size for splitting large prompts (characters)
-CHUNK_SIZE = 110000
+CHUNK_SIZE = 140000
+
+# Max chunks per session before rotating identity.
+# Set to 1 to revert to "Old Architecture" (New Session every chunk) - Most Reliable
+# Set to 3 to use "Hybrid Architecture" (Rotates every 3 chunks) - Stealthier
+CHUNK_ROTATION_LIMIT = 3
+
+# Set to True to reuse the same LMArena session ID for the same API Key + Model.
+# This mimics "Direct Chat" behavior and can help bypass "New Session" rate limits (422/429).
+STICKY_SESSIONS = True
 # ============================================================
 
 def debug_print(*args, **kwargs):
@@ -315,6 +326,8 @@ dashboard_sessions = {}
 api_key_usage = defaultdict(list)
 # { "model_id": count }
 model_usage_stats = defaultdict(int)
+# { "api_key_model": "session_id" }
+sticky_session_ids = {}
 
 # --- Helper Functions ---
 
@@ -1723,7 +1736,7 @@ async def list_models():
             "id": model_name,
             "object": "model",
             "created": int(asyncio.get_event_loop().time()),
-            "owned_by": "VVV",
+            "owned_by": "vvv",
             "type": "chat"  # Default type since we only have model names
         })
     
@@ -2140,9 +2153,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         debug_print(f"💭 Auto-generated Conversation ID: {conversation_id}")
         debug_print(f"🔑 Conversation key: {conversation_key[:100]}...")
         
-        headers = get_request_headers()
-        debug_print(f"📋 Headers prepared (auth token length: {len(headers.get('Cookie', '').split('arena-auth-prod-v1=')[-1].split(';')[0])} chars)")
-        
         debug_print("🆕 Creating NEW conversation session")
         # New conversation - Generate session ID once
         # Note: This session_id is used as the "evaluationSessionId" for messages,
@@ -2164,7 +2174,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Local history for this multi-turn request
         local_messages = []
 
-        async def get_chunk_payload(chunk_index, chunk_content, is_last):
+        async def get_chunk_payload(chunk_index, chunk_content, is_last, session_id, is_new_session):
             # Prepare content with warnings if needed
             final_content = chunk_content
             if total_chunks > 1:
@@ -2175,7 +2185,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     final_content = f"[YOU CAN RESPOND NOW. THIS IS THE CHUNK {current_chunk_num} OF {total_chunks}]\n\n" + final_content
 
             # Generate IDs for this turn
-            current_eval_id = str(uuid7()) # Unique for every request
+            payload_id = str(uuid7())
             user_msg_id = str(uuid7())
             model_msg_id = str(uuid7())
             
@@ -2193,7 +2203,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 "parentMessageIds": parent_ids,
                 "participantPosition": "a",
                 "modelId": None,
-                "evaluationSessionId": current_eval_id,
+                "evaluationSessionId": session_id,
                 "status": "pending",
                 "failureReason": None
             }
@@ -2207,7 +2217,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 "parentMessageIds": [user_msg_id],
                 "participantPosition": "a",
                 "modelId": model_id,
-                "evaluationSessionId": current_eval_id,
+                "evaluationSessionId": session_id,
                 "status": "pending",
                 "failureReason": None
             }
@@ -2216,13 +2226,16 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             # We use 'userMessage' for the current message, and 'messages' for history.
             
             payload_messages = []
-            for msg in local_messages:
-                msg_copy = msg.copy()
-                msg_copy["evaluationSessionId"] = current_eval_id
-                payload_messages.append(msg_copy)
+            
+            # LOGIC UPDATE: Send history if it's the first chunk OR if we just rotated sessions
+            if is_new_session:
+                for msg in local_messages:
+                    msg_copy = msg.copy()
+                    msg_copy["evaluationSessionId"] = session_id # Import history into NEW session
+                    payload_messages.append(msg_copy)
             
             payload = {
-                "id": current_eval_id,
+                "id": payload_id,
                 "mode": "direct",
                 "modelAId": model_id,
                 "userMessageId": user_msg_id,
@@ -2257,135 +2270,255 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     debug_print("🌊 generate_stream started")
                     chunk_id = f"chatcmpl-{uuid.uuid4()}"
                     
+                    current_headers = None
+                    current_session_id = None
+                    
+                    # --- BROWSER CONSISTENCY ---
+                    # We must use Firefox to match the cf_clearance cookie obtained by Camoufox.
+                    # Randomizing this will break the Cloudflare session.
+                    
                     for i, chunk in enumerate(chunks):
-                        full_headers = get_request_headers()
-                        # Filter headers to let curl_cffi handle browser fingerprinting
-                        # We only pass essential headers that carry state or content info.
-                        # Passing User-Agent or Sec-Fetch-* manually can conflict with curl_cffi's impersonation.
-                        chunk_headers = {
-                            "Cookie": full_headers.get("Cookie"),
-                            "Content-Type": full_headers.get("Content-Type"),
-                            "Referer": full_headers.get("Referer"),
-                            "Origin": full_headers.get("Origin"),
-                            "User-Agent": full_headers.get("User-Agent"),
-                        }
-                        # Remove None values
-                        chunk_headers = {k: v for k, v in chunk_headers.items() if v is not None}
+                        # --- ROTATION LOGIC ---
+                        is_new_session = False
+                        if i % CHUNK_ROTATION_LIMIT == 0:
+                            debug_print(f"🔄 Batch Rotation: Switching to New Token & Session for Chunk {i+1}")
+                            
+                            # --- STICKY SESSION LOGIC ---
+                            sticky_key = f"{api_key_str}:{model_public_name}"
+                            if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                data = sticky_session_ids[sticky_key]
+                                current_session_id = data["session_id"]
+                                current_headers = data["headers"]
+                                debug_print(f"📎 Reusing Sticky Session ID: {current_session_id}")
+                                is_new_session = False
+                            else:
+                                current_headers = get_request_headers()
+                                current_session_id = str(uuid7())
+                                if STICKY_SESSIONS:
+                                    sticky_session_ids[sticky_key] = {
+                                        "session_id": current_session_id,
+                                        "headers": current_headers
+                                    }
+                                    debug_print(f"📎 Created New Sticky Session ID: {current_session_id}")
+                                is_new_session = True
+                            
+                            # --- FUTURE PROOFING: Thinking Delay ---
+                            # Add a small random delay for the first chunk of a new session to mimic human thinking
+                            if i == 0:
+                                think_delay = random.uniform(0.5, 1.5)
+                                debug_print(f"🤔 Thinking delay: {think_delay:.2f}s")
+                                await asyncio.sleep(think_delay)
                         
-                        debug_print(f"📋 Using filtered headers for chunk {i+1} (Cookie len: {len(chunk_headers.get('Cookie', ''))})")
+                        # --- RETRY LOOP FOR 429s/401s ---
+                        for attempt in range(5):
+                            # Filter headers to let curl_cffi handle browser fingerprinting
+                            # We only pass essential headers that carry state or content info.
+                            # IMPORTANT: Do NOT pass User-Agent here, let curl_cffi set it to match the impersonation target.
+                            chunk_headers = {
+                                "Cookie": current_headers.get("Cookie"),
+                                "Content-Type": current_headers.get("Content-Type"),
+                                "Referer": current_headers.get("Referer"),
+                                "Origin": current_headers.get("Origin"),
+                                # "User-Agent": current_headers.get("User-Agent"), # REMOVED to prevent fingerprint mismatch
+                            }
+                            # Remove None values
+                            chunk_headers = {k: v for k, v in chunk_headers.items() if v is not None}
+                            
+                            # Extract and log token index
+                            token_match = re.search(r'arena-auth-prod-v1=([^;]+)', chunk_headers.get("Cookie", ""))
+                            token_display = "Unknown"
+                            if token_match:
+                                current_token = token_match.group(1)
+                                try:
+                                    _tokens = get_config().get("auth_tokens", [])
+                                    if current_token in _tokens:
+                                        token_display = f"#{_tokens.index(current_token) + 1}"
+                                    else:
+                                        token_display = "Unlisted"
+                                except: pass
+                            
+                            debug_print(f"📋 Chunk {i+1} | Token {token_display} | Session: {current_session_id}")
 
-                        is_last = (i == len(chunks) - 1)
-                        payload, user_msg, model_msg = await get_chunk_payload(i, chunk, is_last)
-                        
-                        # Store response text for this chunk to update history
-                        current_response_text = ""
-                        
-                        try:
-                            # Use curl_cffi to impersonate Firefox to match AsyncCamoufox's cookies
-                            async with AsyncSession() as client:
-                                # Note: curl_cffi stream API is slightly different
-                                response = await client.post(url, json=payload, headers=chunk_headers, timeout=120, stream=True)
-                                
-                                if response.status_code == 403:
-                                    debug_print(f"❌ 403 Forbidden. Response: {await response.atext()}")
-                                    # Try to print headers to see what we sent
-                                    debug_print(f"   Sent Headers: {chunk_headers.keys()}")
-                                    debug_print(f"   Sent Cookie: {chunk_headers.get('Cookie')[:50]}...")
-                                
-                                if response.status_code >= 400:
-                                    raise HTTPException(status_code=response.status_code, detail=f"Upstream error: {response.status_code}")
+                            is_last = (i == len(chunks) - 1)
+                            payload, user_msg, model_msg = await get_chunk_payload(i, chunk, is_last, current_session_id, is_new_session)
+                            
+                            # Store response text for this chunk to update history
+                            current_response_text = ""
+                            
+                            try:
+                                # Use curl_cffi to impersonate Firefox to match AsyncCamoufox's cookies
+                                async with AsyncSession() as client:
+                                    # Note: curl_cffi stream API is slightly different
+                                    response = await client.post(url, json=payload, headers=chunk_headers, timeout=120, stream=True)
+                                    
+                                    if response.status_code == 403:
+                                        debug_print(f"❌ 403 Forbidden. Response: {await response.atext()}")
+                                        # Try to print headers to see what we sent
+                                        debug_print(f"   Sent Headers: {chunk_headers.keys()}")
+                                        debug_print(f"   Sent Cookie: {chunk_headers.get('Cookie')[:50]}...")
+                                    
+                                    # HANDLE 429 (Rate Limit), 401 (Unauthorized), and 403 (Forbidden)
+                                    if response.status_code in [429, 401, 403]:
+                                        error_type = "Rate Limit" if response.status_code == 429 else "Auth Error"
+                                        debug_print(f"⚠️ {response.status_code} ({error_type}) on Chunk {i+1}")
 
-                                if not is_last:
-                                    # Consume intermediate chunks
-                                    async for line in response.aiter_lines():
-                                        line = line.decode('utf-8').strip() if isinstance(line, bytes) else line.strip()
-                                        if line.startswith("a0:"):
-                                            try:
-                                                text_chunk = json.loads(line[3:])
-                                                current_response_text += text_chunk
-                                            except: 
-                                                pass
+                                        # If we get an error on a sticky session, it means the session/token is dead.
+                                        if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                            debug_print(f"   Invalidating Sticky Session {current_session_id}...")
+                                            del sticky_session_ids[sticky_key]
                                         
-                                        # Update history
+                                        # Only retry if we haven't exhausted attempts
+                                        if attempt < 4:
+                                            debug_print(f"♻️ Rotating to NEXT token/session and retrying (Attempt {attempt+2}/5)...")
+                                            
+                                            # Force a small cool-down to avoid hammering
+                                            await asyncio.sleep(2)
+                                            
+                                            # Generate new identity
+                                            current_headers = get_request_headers() # This gets the NEXT token in the list
+                                            current_session_id = str(uuid7())
+                                            is_new_session = True # Force history resend for new session
+                                            
+                                            if STICKY_SESSIONS:
+                                                sticky_session_ids[sticky_key] = {
+                                                    "session_id": current_session_id,
+                                                    "headers": current_headers
+                                                }
+                                            continue # Retry loop
+                                        
+                                        # If we ran out of retries, raise the error
+                                        raise HTTPException(status_code=response.status_code, detail=f"Upstream error: {response.status_code}")
+
+                                    if response.status_code >= 400:
+                                        raise HTTPException(status_code=response.status_code, detail=f"Upstream error: {response.status_code}")
+
+                                    if not is_last:
+                                        # Consume intermediate chunks
+                                        async for line in response.aiter_lines():
+                                            line = line.decode('utf-8').strip() if isinstance(line, bytes) else line.strip()
+                                            if line.startswith("a0:"):
+                                                try:
+                                                    text_chunk = json.loads(line[3:])
+                                                    current_response_text += text_chunk
+                                                except: 
+                                                    pass
+                                            
+                                            # Update history
+                                            user_msg["status"] = "success"
+                                            model_msg["content"] = current_response_text
+                                            model_msg["status"] = "success"
+                                            
+                                        # Log ONCE after loop
+                                        debug_print(f"✅ Intermediate chunk {i+1} sent. Response len: {len(current_response_text)}")
+                                        local_messages.append(user_msg)
+                                        local_messages.append(model_msg)
+                                        
+                                        await asyncio.sleep(0.5)
+                                    else:
+                                        # Stream final chunk
+                                        async for line in response.aiter_lines():
+                                            line = line.decode('utf-8').strip() if isinstance(line, bytes) else line.strip()
+                                            if not line: continue
+                                            
+                                            if line.startswith("a0:"):
+                                                chunk_data = line[3:]
+                                                try:
+                                                    text_chunk = json.loads(chunk_data)
+                                                    current_response_text += text_chunk
+                                                    
+                                                    chunk_response = {
+                                                        "id": chunk_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": model_public_name,
+                                                        "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}]
+                                                    }
+                                                    yield f"data: {json.dumps(chunk_response)}\n\n"
+                                                except: pass
+                                            elif line.startswith("ad:"):
+                                                try:
+                                                    metadata = json.loads(line[3:])
+                                                    finish_reason = metadata.get("finishReason", "stop")
+                                                    final_chunk = {
+                                                        "id": chunk_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": model_public_name,
+                                                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                                                    }
+                                                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                                                except: pass
+                                            elif line.startswith("a3:"):
+                                                error_data = line[3:]
+                                                try:
+                                                    error_message = json.loads(error_data)
+                                                    print(f"  ❌ Error in stream: {error_message}")
+                                                    error_chunk = {
+                                                        "error": {
+                                                            "message": str(error_message),
+                                                            "type": "api_error",
+                                                            "code": 500
+                                                        }
+                                                    }
+                                                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                                                except: pass
+                                        
+                                        # Update history (though not strictly needed for final chunk unless we want to save it)
                                         user_msg["status"] = "success"
                                         model_msg["content"] = current_response_text
                                         model_msg["status"] = "success"
-                                        
-                                    # Log ONCE after loop
-                                    debug_print(f"✅ Intermediate chunk {i+1} sent. Response len: {len(current_response_text)}")
-                                    local_messages.append(user_msg)
-                                    local_messages.append(model_msg)
-                                    
-                                    await asyncio.sleep(0.5)
-                                else:
-                                    # Stream final chunk
-                                    async for line in response.aiter_lines():
-                                        line = line.decode('utf-8').strip() if isinstance(line, bytes) else line.strip()
-                                        if not line: continue
-                                        
-                                        if line.startswith("a0:"):
-                                            chunk_data = line[3:]
-                                            try:
-                                                text_chunk = json.loads(chunk_data)
-                                                current_response_text += text_chunk
+                                        local_messages.append(user_msg)
+                                        local_messages.append(model_msg)
                                                 
-                                                chunk_response = {
-                                                    "id": chunk_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": model_public_name,
-                                                    "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}]
-                                                }
-                                                yield f"data: {json.dumps(chunk_response)}\n\n"
-                                            except: pass
-                                        elif line.startswith("ad:"):
-                                            try:
-                                                metadata = json.loads(line[3:])
-                                                finish_reason = metadata.get("finishReason", "stop")
-                                                final_chunk = {
-                                                    "id": chunk_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": model_public_name,
-                                                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
-                                                }
-                                                yield f"data: {json.dumps(final_chunk)}\n\n"
-                                            except: pass
-                                        elif line.startswith("a3:"):
-                                            error_data = line[3:]
-                                            try:
-                                                error_message = json.loads(error_data)
-                                                print(f"  ❌ Error in stream: {error_message}")
-                                                error_chunk = {
-                                                    "error": {
-                                                        "message": str(error_message),
-                                                        "type": "api_error",
-                                                        "code": 500
-                                                    }
-                                                }
-                                                yield f"data: {json.dumps(error_chunk)}\n\n"
-                                            except: pass
+                                        yield "data: [DONE]\n\n"
+                                        debug_print(f"✅ Stream completed")
                                     
-                                    # Update history (though not strictly needed for final chunk unless we want to save it)
-                                    user_msg["status"] = "success"
-                                    model_msg["content"] = current_response_text
-                                    model_msg["status"] = "success"
-                                    local_messages.append(user_msg)
-                                    local_messages.append(model_msg)
-                                            
-                                    yield "data: [DONE]\n\n"
-                                    debug_print(f"✅ Stream completed")
+                                    # Success - break retry loop
+                                    break
 
-                        except Exception as e:
-                            print(f"❌ Stream error: {str(e)}")
-                            error_chunk = {
-                                "error": {
-                                    "message": str(e),
-                                    "type": "internal_error"
+                            except (HTTPError, Timeout, RequestsError) as e:
+                                print(f"❌ Stream error (curl_cffi): {str(e)}")
+                                
+                                if attempt < 4:
+                                    debug_print(f"⚠️ Connection error on Chunk {i+1}. Rotating and retrying (Attempt {attempt+2}/5)...")
+                                    
+                                    if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                        debug_print(f"   Invalidating Sticky Session {current_session_id}...")
+                                        del sticky_session_ids[sticky_key]
+                                    
+                                    await asyncio.sleep(2)
+                                    current_headers = get_request_headers()
+                                    current_session_id = str(uuid7())
+                                    is_new_session = True
+                                    
+                                    if STICKY_SESSIONS:
+                                        sticky_session_ids[sticky_key] = {
+                                            "session_id": current_session_id,
+                                            "headers": current_headers
+                                        }
+                                    continue # Retry loop
 
+                                error_chunk = {
+                                    "error": {
+                                        "message": f"Upstream error: {str(e)}",
+                                        "type": "upstream_error",
+                                        "code": 502
+                                    }
                                 }
-                            }
-                            yield f"data: {json.dumps(error_chunk)}\n\n"
+                                yield f"data: {json.dumps(error_chunk)}\n\n"
+                                debug_print(f"⛔ Chunk {i+1} failed after {attempt+1} attempts. Aborting stream.")
+                                return # Stop the stream completely to avoid sending a broken prompt
+                            except Exception as e:
+                                print(f"❌ Stream error (general): {str(e)}")
+                                error_chunk = {
+                                    "error": {
+                                        "message": str(e),
+                                        "type": "internal_error"
+
+                                    }
+                                }
+                                yield f"data: {json.dumps(error_chunk)}\n\n"
+                                break # Break retry loop
                 finally:
                     global active_generations
                     active_generations -= 1
@@ -2398,170 +2531,244 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Handle non-streaming mode
         # Use curl_cffi for non-streaming as well
         try:
-            async with AsyncSession(impersonate="firefox133") as client:
+            # --- BROWSER CONSISTENCY ---
+
+            async with AsyncSession() as client:
                 final_response = None
                 
+                current_headers = None
+                current_session_id = None
+                
                 for i, chunk in enumerate(chunks):
-                    full_headers = get_request_headers()
-                    chunk_headers = {
-                        "Cookie": full_headers.get("Cookie"),
-                        "Content-Type": full_headers.get("Content-Type"),
-                        "Referer": full_headers.get("Referer"),
-                        "Origin": full_headers.get("Origin"),
-                        "User-Agent": full_headers.get("User-Agent"),
-                    }
-                    chunk_headers = {k: v for k, v in chunk_headers.items() if v is not None}
-
-                    is_last = (i == len(chunks) - 1)
-                    payload, user_msg, model_msg = await get_chunk_payload(i, chunk, is_last)
-                    
-                    current_response_text = ""
-                    finish_reason = "stop"
-                    error_message = None
-                    
-                    try:
-                        debug_print(f"📡 Sending POST request for chunk {i+1}...")
-                        response = await client.post(url, json=payload, headers=chunk_headers, timeout=120)
+                    # --- ROTATION LOGIC ---
+                    is_new_session = False
+                    if i % CHUNK_ROTATION_LIMIT == 0:
+                        debug_print(f"🔄 Batch Rotation: Switching to New Token & Session for Chunk {i+1}")
                         
-                        if not is_last:
+                        # --- STICKY SESSION LOGIC ---
+                        sticky_key = f"{api_key_str}:{model_public_name}"
+                        if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                            data = sticky_session_ids[sticky_key]
+                            current_session_id = data["session_id"]
+                            current_headers = data["headers"]
+                            debug_print(f"📎 Reusing Sticky Session ID: {current_session_id}")
+                            is_new_session = False
+                        else:
+                            current_headers = get_request_headers()
+                            current_session_id = str(uuid7())
+                            if STICKY_SESSIONS:
+                                sticky_session_ids[sticky_key] = {
+                                    "session_id": current_session_id,
+                                    "headers": current_headers
+                                }
+                                debug_print(f"📎 Created New Sticky Session ID: {current_session_id}")
+                            is_new_session = True
+                        
+                        # --- FUTURE PROOFING: Thinking Delay ---
+                        if i == 0:
+                            think_delay = random.uniform(0.5, 1.5)
+                            debug_print(f"🤔 Thinking delay: {think_delay:.2f}s")
+                            await asyncio.sleep(think_delay)
+
+                    # --- RETRY LOOP FOR 429s/401s ---
+                    for attempt in range(5):
+                        chunk_headers = {
+                            "Cookie": current_headers.get("Cookie"),
+                            "Content-Type": current_headers.get("Content-Type"),
+                            "Referer": current_headers.get("Referer"),
+                            "Origin": current_headers.get("Origin"),
+                            # "User-Agent": current_headers.get("User-Agent"), # REMOVED
+                        }
+                        chunk_headers = {k: v for k, v in chunk_headers.items() if v is not None}
+
+                        # Extract and log token index
+                        token_match = re.search(r'arena-auth-prod-v1=([^;]+)', chunk_headers.get("Cookie", ""))
+                        token_display = "Unknown"
+                        if token_match:
+                            current_token = token_match.group(1)
+                            try:
+                                _tokens = get_config().get("auth_tokens", [])
+                                if current_token in _tokens:
+                                    token_display = f"#{_tokens.index(current_token) + 1}"
+                                else:
+                                    token_display = "Unlisted"
+                            except: pass
+                        
+                        debug_print(f"📋 Chunk {i+1} | Token {token_display} | Session: {current_session_id}")
+
+                        is_last = (i == len(chunks) - 1)
+                        payload, user_msg, model_msg = await get_chunk_payload(i, chunk, is_last, current_session_id, is_new_session)
+                        
+                        current_response_text = ""
+                        finish_reason = "stop"
+                        error_message = None
+                        
+                        try:
+                            debug_print(f"📡 Sending POST request for chunk {i+1}...")
+                            response = await client.post(url, json=payload, headers=chunk_headers, timeout=120)
+                            
+                            # HANDLE 429 (Rate Limit), 401 (Unauthorized), and 403 (Forbidden)
+                            if response.status_code in [429, 401, 403]:
+                                error_type = "Rate Limit" if response.status_code == 429 else "Auth Error"
+                                debug_print(f"⚠️ {response.status_code} ({error_type}) on Chunk {i+1}")
+
+                                if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                    debug_print(f"   Invalidating Sticky Session {current_session_id}...")
+                                    del sticky_session_ids[sticky_key]
+                                
+                                if attempt < 4:
+                                    debug_print(f"♻️ Rotating to NEXT token/session and retrying (Attempt {attempt+2}/5)...")
+                                    await asyncio.sleep(2)
+                                    current_headers = get_request_headers()
+                                    current_session_id = str(uuid7())
+                                    is_new_session = True
+                                    
+                                    if STICKY_SESSIONS:
+                                        sticky_session_ids[sticky_key] = {
+                                            "session_id": current_session_id,
+                                            "headers": current_headers
+                                        }
+                                    continue # Retry loop
+                            
+                            if not is_last:
+                                response.raise_for_status()
+                                
+                                # Parse response to get content for history
+                                for line in response.text.splitlines():
+                                    line = line.strip()
+                                    if line.startswith("a0:"):
+                                        try:
+                                            text_chunk = json.loads(line[3:])
+                                            current_response_text += text_chunk
+                                        except: pass
+                                
+                                debug_print(f"✅ Intermediate chunk {i+1} sent. Response len: {len(current_response_text)}")
+                                
+                                # Update history
+                                user_msg["status"] = "success"
+                                model_msg["content"] = current_response_text
+                                model_msg["status"] = "success"
+                                local_messages.append(user_msg)
+                                local_messages.append(model_msg)
+                                
+                                await asyncio.sleep(0.5)
+                                break # Success, break retry loop and continue to next chunk
+                            
+                            # Process final response
+                            debug_print(f"✅ Final response received - Status: {response.status_code}")
                             response.raise_for_status()
                             
-                            # Parse response to get content for history
                             for line in response.text.splitlines():
                                 line = line.strip()
+                                if not line: continue
+                                
                                 if line.startswith("a0:"):
+                                    chunk_data = line[3:]
                                     try:
-                                        text_chunk = json.loads(line[3:])
+                                        text_chunk = json.loads(chunk_data)
                                         current_response_text += text_chunk
                                     except: pass
+                                elif line.startswith("a3:"):
+                                    error_data = line[3:]
+                                    try:
+                                        error_message = json.loads(error_data)
+                                    except: error_message = error_data
+                                elif line.startswith("ad:"):
+                                    try:
+                                        metadata = json.loads(line[3:])
+                                        finish_reason = metadata.get("finishReason", "stop")
+                                    except: pass
+
+                            if not current_response_text and error_message:
+                                return {
+                                    "error": {
+                                        "message": f"Proxy error: {error_message}",
+                                        "type": "upstream_error",
+                                        "code": "lmarena_error"
+                                    }
+                                }
                             
-                            debug_print(f"✅ Intermediate chunk {i+1} sent. Response len: {len(current_response_text)}")
-                            
-                            # Update history
+                            # Update session (for final chunk)
                             user_msg["status"] = "success"
                             model_msg["content"] = current_response_text
                             model_msg["status"] = "success"
                             local_messages.append(user_msg)
                             local_messages.append(model_msg)
                             
-                            await asyncio.sleep(0.5)
-                            continue
-                        
-                        # Process final response
-                        debug_print(f"✅ Final response received - Status: {response.status_code}")
-                        response.raise_for_status()
-                        
-                        for line in response.text.splitlines():
-                            line = line.strip()
-                            if not line: continue
-                            
-                            if line.startswith("a0:"):
-                                chunk_data = line[3:]
-                                try:
-                                    text_chunk = json.loads(chunk_data)
-                                    current_response_text += text_chunk
-                                except: pass
-                            elif line.startswith("a3:"):
-                                error_data = line[3:]
-                                try:
-                                    error_message = json.loads(error_data)
-                                except: error_message = error_data
-                            elif line.startswith("ad:"):
-                                try:
-                                    metadata = json.loads(line[3:])
-                                    finish_reason = metadata.get("finishReason", "stop")
-                                except: pass
+                            # Save to global session (optional, but good for debugging)
+                            if conversation_id not in chat_sessions[api_key_str]:
+                                chat_sessions[api_key_str][conversation_id] = {
+                                    "conversation_id": payload["id"], # Use last eval ID
+                                    "model": model_public_name,
+                                    "messages": local_messages
+                                }
 
-                        if not current_response_text and error_message:
-                             return {
+                            final_response = {
+                                "id": f"chatcmpl-{uuid.uuid4()}",
+                                "object": "chat.completion",
+                                "created": int(time.time()),
+                                "model": model_public_name,
+                                "conversation_id": conversation_id,
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": current_response_text.strip(),
+                                    },
+                                    "finish_reason": finish_reason
+                                }],
+                                "usage": {
+                                    "prompt_tokens": len(prompt),
+                                    "completion_tokens": len(current_response_text),
+                                    "total_tokens": len(prompt) + len(current_response_text)
+                                }
+                            }
+                            
+                            debug_print(f"\n✅ REQUEST COMPLETED SUCCESSFULLY")
+                            debug_print("="*80 + "\n")
+                            
+                            return final_response
+                        
+                        except HTTPError as e:
+                            error_detail = f"Sayori Proxy error: {e.response.status_code}"
+                            try:
+                                error_body = e.response.json()
+                                error_detail += f" - {error_body}"
+                            except:
+                                error_detail += f" - {e.response.text[:200]}"
+                            print(f"\n❌ HTTP STATUS ERROR (curl_cffi)")
+                            print(f"📛 Error detail: {error_detail}")
+                            
+                            error_type = "rate_limit_error" if e.response.status_code == 429 else "upstream_error"
+                            return {
                                 "error": {
-                                    "message": f"Proxy error: {error_message}",
-                                    "type": "upstream_error",
-                                    "code": "lmarena_error"
+                                    "message": "The API is overloaded at the moment. Try again later.",
+                                    "type": error_type,
+                                    "code": f"http_{e.response.status_code}"
                                 }
                             }
                         
-                        # Update session (for final chunk)
-                        user_msg["status"] = "success"
-                        model_msg["content"] = current_response_text
-                        model_msg["status"] = "success"
-                        local_messages.append(user_msg)
-                        local_messages.append(model_msg)
+                        except Timeout as e:
+                            print(f"\n⏱️  TIMEOUT ERROR (curl_cffi)")
+                            return {
+                                "error": {
+                                    "message": "Request to Sayori Proxy timed out after 120 seconds",
+                                    "type": "timeout_error",
+                                    "code": "request_timeout"
+                                }
+                            }
                         
-                        # Save to global session (optional, but good for debugging)
-                        if conversation_id not in chat_sessions[api_key_str]:
-                            chat_sessions[api_key_str][conversation_id] = {
-                                "conversation_id": payload["id"], # Use last eval ID
-                                "model": model_public_name,
-                                "messages": local_messages
+                        except Exception as e:
+                            print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
+                            print(f"📛 Error type: {type(e).__name__}")
+                            print(f"📛 Error message: {str(e)}")
+                            return {
+                                "error": {
+                                    "message": "Unexpected error in HTTP Client.}",
+                                    "type": "internal_error",
+                                    "code": type(e).__name__.lower()
+                                }
                             }
-
-                        final_response = {
-                            "id": f"chatcmpl-{uuid.uuid4()}",
-                            "object": "chat.completion",
-                            "created": int(time.time()),
-                            "model": model_public_name,
-                            "conversation_id": conversation_id,
-                            "choices": [{
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": current_response_text.strip(),
-                                },
-                                "finish_reason": finish_reason
-                            }],
-                            "usage": {
-                                "prompt_tokens": len(prompt),
-                                "completion_tokens": len(current_response_text),
-                                "total_tokens": len(prompt) + len(current_response_text)
-                            }
-                        }
-                        
-                        debug_print(f"\n✅ REQUEST COMPLETED SUCCESSFULLY")
-                        debug_print("="*80 + "\n")
-                        
-                        return final_response
-
-                    except httpx.HTTPStatusError as e:
-                        error_detail = f"Sayori Proxy error: {e.response.status_code}"
-                        try:
-                            error_body = e.response.json()
-                            error_detail += f" - {error_body}"
-                        except:
-                            error_detail += f" - {e.response.text[:200]}"
-                        print(f"\n❌ HTTP STATUS ERROR")
-                        print(f"📛 Error detail: {error_detail}")
-                        
-                        error_type = "rate_limit_error" if e.response.status_code == 429 else "upstream_error"
-                        return {
-                            "error": {
-                                "message": "The API is overloaded at the moment. Try again later.",
-                                "type": error_type,
-                                "code": f"http_{e.response.status_code}"
-                            }
-                        }
-                    
-                    except httpx.TimeoutException as e:
-                        print(f"\n⏱️  TIMEOUT ERROR")
-                        return {
-                            "error": {
-                                "message": "Request to Sayori Proxy timed out after 120 seconds",
-                                "type": "timeout_error",
-                                "code": "request_timeout"
-                            }
-                        }
-                    
-                    except Exception as e:
-                        print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
-                        print(f"📛 Error type: {type(e).__name__}")
-                        print(f"📛 Error message: {str(e)}")
-                        return {
-                            "error": {
-                                "message": "Unexpected error in HTTP Client.}",
-                                "type": "internal_error",
-                                "code": type(e).__name__.lower()
-                            }
-                        }
         finally:
             pass
                 
