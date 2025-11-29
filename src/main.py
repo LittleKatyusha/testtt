@@ -942,7 +942,7 @@ async def login_page(request: Request, error: Optional[str] = None):
         </head>
         <body>
             <div class="login-container">
-                <h1>LMArena Bridge</h1>
+                <h1>UMA !!</h1>
                 <div class="subtitle">Sign in to access the dashboard</div>
                 {error_msg}
                 <form action="/login" method="post">
