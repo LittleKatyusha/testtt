@@ -860,7 +860,7 @@ async def login_page(request: Request, error: Optional[str] = None):
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Login - LMArena Bridge</title>
+            <title>Login - UMA !!!</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
                 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
