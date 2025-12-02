@@ -1013,6 +1013,7 @@ async def dashboard(session: str = Depends(get_current_session)):
             token_preview = f"{token[:20]}...{token[-10:]}" if len(token) > 30 else token
             tokens_html += f"""
                 <tr>
+                    <td><input type="checkbox" class="token-checkbox" value="{idx}" style="cursor: pointer;"></td>
                     <td><strong>Token {idx + 1}</strong></td>
                     <td><code class="api-key-code">{token_preview}</code></td>
                     <td>
@@ -1024,7 +1025,7 @@ async def dashboard(session: str = Depends(get_current_session)):
                 </tr>
             """
     else:
-        tokens_html = '<tr><td colspan="3" class="no-data">No auth tokens configured</td></tr>'
+        tokens_html = '<tr><td colspan="4" class="no-data">No auth tokens configured</td></tr>'
 
     # Render Models (limit to first 20 with text output)
     text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
@@ -1376,9 +1377,18 @@ async def dashboard(session: str = Depends(get_current_session)):
                         <span class="status-badge {token_class}">{len(auth_tokens)} Token(s)</span>
                     </div>
                     
+                    <div style="margin-bottom: 15px; display: flex; gap: 10px; align-items: center;">
+                        <button type="button" id="selectAllTokens" class="btn" style="background: #6c757d; color: white; padding: 8px 16px;">Select All</button>
+                        <button type="button" id="deleteSelectedTokens" class="btn-delete" style="padding: 8px 16px; display: none;">Delete Selected</button>
+                        <span id="selectedCount" style="color: #666; font-size: 14px;"></span>
+                    </div>
+                    
                     <table style="margin-bottom: 20px;">
                         <thead>
                             <tr>
+                                <th style="width: 40px;">
+                                    <input type="checkbox" id="selectAllCheckbox" style="cursor: pointer;">
+                                </th>
                                 <th>Name</th>
                                 <th>Token</th>
                                 <th>Action</th>
@@ -1608,10 +1618,133 @@ async def dashboard(session: str = Depends(get_current_session)):
                     document.getElementById('modelPieChart').parentElement.innerHTML = '<p style="text-align: center; color: #999; padding: 50px;">No usage data yet</p>';
                     document.getElementById('modelBarChart').parentElement.innerHTML = '<p style="text-align: center; color: #999; padding: 50px;">No usage data yet</p>';
                 }}
+                
+                // Token selection and batch delete functionality
+                const selectAllCheckbox = document.getElementById('selectAllCheckbox');
+                const selectAllBtn = document.getElementById('selectAllTokens');
+                const deleteSelectedBtn = document.getElementById('deleteSelectedTokens');
+                const selectedCountSpan = document.getElementById('selectedCount');
+                const tokenCheckboxes = document.querySelectorAll('.token-checkbox');
+                
+                function updateSelectedCount() {{
+                    const checkedCount = document.querySelectorAll('.token-checkbox:checked').length;
+                    if (checkedCount > 0) {{
+                        selectedCountSpan.textContent = `${{checkedCount}} token(s) selected`;
+                        deleteSelectedBtn.style.display = 'inline-block';
+                    }} else {{
+                        selectedCountSpan.textContent = '';
+                        deleteSelectedBtn.style.display = 'none';
+                    }}
+                    
+                    // Update select all checkbox state
+                    if (checkedCount === tokenCheckboxes.length && tokenCheckboxes.length > 0) {{
+                        selectAllCheckbox.checked = true;
+                        selectAllCheckbox.indeterminate = false;
+                    }} else if (checkedCount > 0) {{
+                        selectAllCheckbox.indeterminate = true;
+                    }} else {{
+                        selectAllCheckbox.checked = false;
+                        selectAllCheckbox.indeterminate = false;
+                    }}
+                }}
+                
+                // Select all checkbox handler
+                if (selectAllCheckbox) {{
+                    selectAllCheckbox.addEventListener('change', function() {{
+                        tokenCheckboxes.forEach(cb => cb.checked = this.checked);
+                        updateSelectedCount();
+                    }});
+                }}
+                
+                // Select all button handler
+                if (selectAllBtn) {{
+                    selectAllBtn.addEventListener('click', function() {{
+                        const allChecked = Array.from(tokenCheckboxes).every(cb => cb.checked);
+                        tokenCheckboxes.forEach(cb => cb.checked = !allChecked);
+                        updateSelectedCount();
+                    }});
+                }}
+                
+                // Individual checkbox handlers
+                tokenCheckboxes.forEach(cb => {{
+                    cb.addEventListener('change', updateSelectedCount);
+                }});
+                
+                // Delete selected tokens handler
+                if (deleteSelectedBtn) {{
+                    deleteSelectedBtn.addEventListener('click', function() {{
+                        const selectedIndices = Array.from(document.querySelectorAll('.token-checkbox:checked'))
+                            .map(cb => cb.value);
+                        
+                        if (selectedIndices.length === 0) {{
+                            alert('Please select at least one token to delete.');
+                            return;
+                        }}
+                        
+                        const confirmMsg = `Are you sure you want to delete ${{selectedIndices.length}} token(s)?`;
+                        if (confirm(confirmMsg)) {{
+                            // Create form and submit
+                            const form = document.createElement('form');
+                            form.method = 'POST';
+                            form.action = '/batch-delete-tokens';
+                            
+                            selectedIndices.forEach(idx => {{
+                                const input = document.createElement('input');
+                                input.type = 'hidden';
+                                input.name = 'token_indices';
+                                input.value = idx;
+                                form.appendChild(input);
+                            }});
+                            
+                            document.body.appendChild(form);
+                            form.submit();
+                        }}
+                    }});
+                }}
+                
+                // Initialize count
+                updateSelectedCount();
             </script>
         </body>
         </html>
     """
+
+@app.post("/batch-delete-tokens")
+async def batch_delete_tokens(request: Request, session: str = Depends(get_current_session)):
+    if not session:
+        return RedirectResponse(url="/login")
+    
+    # Get form data
+    form_data = await request.form()
+    token_indices_str = form_data.getlist("token_indices")
+    
+    if not token_indices_str:
+        return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+    
+    # Convert to integers and sort in descending order to delete from end to start
+    # This prevents index shifting issues
+    try:
+        token_indices = sorted([int(idx) for idx in token_indices_str], reverse=True)
+    except ValueError:
+        debug_print("❌ Invalid token indices received")
+        return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+    
+    config = get_config()
+    auth_tokens = config.get("auth_tokens", [])
+    
+    deleted_count = 0
+    for idx in token_indices:
+        if 0 <= idx < len(auth_tokens):
+            token_value = auth_tokens.pop(idx)
+            deleted_count += 1
+            token_preview = token_value[:20] if len(token_value) > 20 else token_value
+            debug_print(f"🗑️ Batch deleted auth token at index {idx}: {token_preview}...")
+    
+    config["auth_tokens"] = auth_tokens
+    save_config(config)
+    
+    debug_print(f"✅ Batch deleted {deleted_count} token(s)")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/update-auth-tokens")
 async def update_auth_tokens(request: Request, auth_tokens: str = Form(...)):
