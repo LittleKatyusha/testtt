@@ -28,7 +28,7 @@ from curl_cffi.requests.exceptions import HTTPError, Timeout, RequestException a
 # CONFIGURATION
 # ============================================================
 # Set to True for detailed logging, False for minimal logging
-DEBUG = False
+DEBUG = True
 
 # Port to run the server on
 PORT = 8081
