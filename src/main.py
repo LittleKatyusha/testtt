@@ -17,6 +17,7 @@ from platformdirs import user_data_dir
 import uvicorn
 from camoufox.async_api import AsyncCamoufox
 from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 
