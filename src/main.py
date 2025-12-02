@@ -860,7 +860,7 @@ async def login_page(request: Request, error: Optional[str] = None):
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Login - UMA !!!</title>
+            <title>Login - LMArena Bridge</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
                 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -942,7 +942,7 @@ async def login_page(request: Request, error: Optional[str] = None):
         </head>
         <body>
             <div class="login-container">
-                <h1>UMA !!</h1>
+                <h1>LMArena Bridge</h1>
                 <div class="subtitle">Sign in to access the dashboard</div>
                 {error_msg}
                 <form action="/login" method="post">
@@ -1013,7 +1013,6 @@ async def dashboard(session: str = Depends(get_current_session)):
             token_preview = f"{token[:20]}...{token[-10:]}" if len(token) > 30 else token
             tokens_html += f"""
                 <tr>
-                    <td><input type="checkbox" class="token-checkbox" value="{idx}" style="cursor: pointer;"></td>
                     <td><strong>Token {idx + 1}</strong></td>
                     <td><code class="api-key-code">{token_preview}</code></td>
                     <td>
@@ -1025,7 +1024,7 @@ async def dashboard(session: str = Depends(get_current_session)):
                 </tr>
             """
     else:
-        tokens_html = '<tr><td colspan="4" class="no-data">No auth tokens configured</td></tr>'
+        tokens_html = '<tr><td colspan="3" class="no-data">No auth tokens configured</td></tr>'
 
     # Render Models (limit to first 20 with text output)
     text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
@@ -1377,18 +1376,9 @@ async def dashboard(session: str = Depends(get_current_session)):
                         <span class="status-badge {token_class}">{len(auth_tokens)} Token(s)</span>
                     </div>
                     
-                    <div style="margin-bottom: 15px; display: flex; gap: 10px; align-items: center;">
-                        <button type="button" id="selectAllTokens" class="btn" style="background: #6c757d; color: white; padding: 8px 16px;">Select All</button>
-                        <button type="button" id="deleteSelectedTokens" class="btn-delete" style="padding: 8px 16px;">Delete Selected</button>
-                        <span id="selectedCount" style="color: #666; font-size: 14px;"></span>
-                    </div>
-                    
                     <table style="margin-bottom: 20px;">
                         <thead>
                             <tr>
-                                <th style="width: 40px;">
-                                    <input type="checkbox" id="selectAllCheckbox" style="cursor: pointer;">
-                                </th>
                                 <th>Name</th>
                                 <th>Token</th>
                                 <th>Action</th>
@@ -1618,92 +1608,6 @@ async def dashboard(session: str = Depends(get_current_session)):
                     document.getElementById('modelPieChart').parentElement.innerHTML = '<p style="text-align: center; color: #999; padding: 50px;">No usage data yet</p>';
                     document.getElementById('modelBarChart').parentElement.innerHTML = '<p style="text-align: center; color: #999; padding: 50px;">No usage data yet</p>';
                 }}
-                // Token selection and batch delete functionality
-                const selectAllCheckbox = document.getElementById('selectAllCheckbox');
-                const selectAllBtn = document.getElementById('selectAllTokens');
-                const deleteSelectedBtn = document.getElementById('deleteSelectedTokens');
-                const selectedCountSpan = document.getElementById('selectedCount');
-                const tokenCheckboxes = document.querySelectorAll('.token-checkbox');
-                
-                function updateSelectedCount() {{
-                    const checkedCount = document.querySelectorAll('.token-checkbox:checked').length;
-                    if (checkedCount > 0) {{
-                        selectedCountSpan.textContent = `${{checkedCount}} token(s) selected`;
-                        deleteSelectedBtn.style.display = 'inline-block';
-                    }} else {{
-                        selectedCountSpan.textContent = '';
-                        deleteSelectedBtn.style.display = 'none';
-                    }}
-                    
-                    // Update select all checkbox state
-                    if (checkedCount === tokenCheckboxes.length && tokenCheckboxes.length > 0) {{
-                        selectAllCheckbox.checked = true;
-                        selectAllCheckbox.indeterminate = false;
-                    }} else if (checkedCount > 0) {{
-                        selectAllCheckbox.indeterminate = true;
-                    }} else {{
-                        selectAllCheckbox.checked = false;
-                        selectAllCheckbox.indeterminate = false;
-                    }}
-                }}
-                
-                // Select all checkbox handler
-                if (selectAllCheckbox) {{
-                    selectAllCheckbox.addEventListener('change', function() {{
-                        tokenCheckboxes.forEach(cb => cb.checked = this.checked);
-                        updateSelectedCount();
-                    }});
-                }}
-                
-                // Select all button handler
-                if (selectAllBtn) {{
-                    selectAllBtn.addEventListener('click', function() {{
-                        const allChecked = Array.from(tokenCheckboxes).every(cb => cb.checked);
-                        tokenCheckboxes.forEach(cb => cb.checked = !allChecked);
-                        updateSelectedCount();
-                    }});
-                }}
-                
-                // Individual checkbox handlers
-                tokenCheckboxes.forEach(cb => {{
-                    cb.addEventListener('change', updateSelectedCount);
-                }});
-                
-                // Delete selected tokens handler
-                if (deleteSelectedBtn) {{
-                    deleteSelectedBtn.style.display = 'none'; // Hide initially
-                    deleteSelectedBtn.addEventListener('click', function() {{
-                        const selectedIndices = Array.from(document.querySelectorAll('.token-checkbox:checked'))
-                            .map(cb => cb.value);
-                        
-                        if (selectedIndices.length === 0) {{
-                            alert('Please select at least one token to delete.');
-                            return;
-                        }}
-                        
-                        const confirmMsg = `Are you sure you want to delete ${{selectedIndices.length}} token(s)?`;
-                        if (confirm(confirmMsg)) {{
-                            // Create form and submit
-                            const form = document.createElement('form');
-                            form.method = 'POST';
-                            form.action = '/batch-delete-tokens';
-                            
-                            selectedIndices.forEach(idx => {{
-                                const input = document.createElement('input');
-                                input.type = 'hidden';
-                                input.name = 'token_indices';
-                                input.value = idx;
-                                form.appendChild(input);
-                            }});
-                            
-                            document.body.appendChild(form);
-                            form.submit();
-                        }}
-                    }});
-                }}
-                
-                // Initialize count
-                updateSelectedCount();
             </script>
         </body>
         </html>
@@ -1746,42 +1650,6 @@ async def delete_token(session: str = Depends(get_current_session), token_index:
         debug_print(f"🗑️ Deleted auth token at index {token_index}: {deleted_token[:20]}...")
     
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-@app.post("/batch-delete-tokens")
-async def batch_delete_tokens(request: Request, session: str = Depends(get_current_session)):
-    if not session:
-        return RedirectResponse(url="/login")
-    
-    # Get form data
-    form_data = await request.form()
-    token_indices_str = form_data.getlist("token_indices")
-    
-    if not token_indices_str:
-        return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-    
-    # Convert to integers and sort in descending order to delete from end to start
-    # This prevents index shifting issues
-    try:
-        token_indices = sorted([int(idx) for idx in token_indices_str], reverse=True)
-    except ValueError:
-        debug_print("❌ Invalid token indices received")
-        return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-    
-    config = get_config()
-    auth_tokens = config.get("auth_tokens", [])
-    
-    deleted_count = 0
-    for idx in token_indices:
-        if 0 <= idx < len(auth_tokens):
-            deleted_token = auth_tokens.pop(idx)
-            deleted_count += 1
-            debug_print(f"🗑️ Batch deleted auth token at index {idx}: {deleted_token[:20]}...")
-    
-    config["auth_tokens"] = auth_tokens
-    save_config(config)
-    
-    debug_print(f"✅ Batch deleted {deleted_count} token(s)")
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-
 
 @app.post("/create-key")
 async def create_key(session: str = Depends(get_current_session), name: str = Form(...), rpm: int = Form(...), rpd: int = Form(...)):
@@ -1868,7 +1736,7 @@ async def list_models():
             "id": model_name,
             "object": "model",
             "created": int(asyncio.get_event_loop().time()),
-            "owned_by": "vvv",
+            "owned_by": "norenaboi",
             "type": "chat"  # Default type since we only have model names
         })
     
@@ -1890,14 +1758,14 @@ async def refresh_recaptcha_token():
         # Look for 'grecaptcha.execute("SITE_KEY"' or similar
         # Or just try to execute grecaptcha if it's loaded
         
-        # 1. Check if grecaptcha is defined (wait for it) - OPTIMIZED: Reduced wait time
+        # 1. Check if grecaptcha is defined (wait for it)
         is_grecaptcha = False
         print("   Waiting for grecaptcha to load...")
-        for i in range(10):  # Reduced from 20 to 10 seconds
+        for i in range(20):
             is_grecaptcha = await page.evaluate("typeof grecaptcha !== 'undefined' || typeof window.grecaptcha !== 'undefined'")
             if is_grecaptcha:
                 break
-            await asyncio.sleep(0.5)  # Reduced from 1s to 0.5s
+            await asyncio.sleep(1)
         
         if is_grecaptcha:
             print("✅ grecaptcha is defined on the page.")
@@ -1959,7 +1827,6 @@ async def refresh_recaptcha_token():
                     print(f"✅ Generated reCAPTCHA token: {token[:20]}...")
                     config = get_config()
                     config["recaptcha_token"] = token
-                    config["recaptcha_last_refresh"] = time.time()
                     save_config(config)
                     return token
                 else:
@@ -2068,20 +1935,19 @@ async def refresh_recaptcha_token():
                     }}
                 """)
                 
-                # 4. Wait for the token to appear in the input - OPTIMIZED
+                # 4. Wait for the token to appear in the input
                 print("   Waiting for token in hidden input...")
                 token = None
-                for _ in range(30):  # Reduced from 60 to 30 seconds
+                for _ in range(60): # Wait up to 60 seconds
                     token = await page.evaluate("document.getElementById('recaptcha-token-output').value")
                     if token:
                         break
-                    await asyncio.sleep(0.5)  # Reduced from 1s to 0.5s
+                    await asyncio.sleep(1)
                 
                 if token and not token.startswith("ERROR"):
                     print(f"✅ Generated reCAPTCHA token via DOM bridge: {token[:20]}...")
                     config = get_config()
                     config["recaptcha_token"] = token
-                    config["recaptcha_last_refresh"] = time.time()
                     save_config(config)
                     return token
                 else:
@@ -2103,21 +1969,12 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
     active_generations += 1
     should_decrement = True
     try:
-        # OPTIMIZATION: Only refresh token if not recently generated or missing
+        # Generate fresh reCAPTCHA token for this request
+        debug_print("🔄 Generating fresh reCAPTCHA token for this request...")
+        await refresh_recaptcha_token()
+
+        # Load config to ensure we have the latest token and it's available for later use
         config = get_config()
-        recaptcha_token = config.get("recaptcha_token")
-        last_refresh = config.get("recaptcha_last_refresh", 0)
-        current_time = time.time()
-        
-        # Refresh only if token is missing or older than 60 seconds
-        if not recaptcha_token or (current_time - last_refresh) > 60:
-            debug_print("🔄 Generating fresh reCAPTCHA token...")
-            await refresh_recaptcha_token()
-            config = get_config()
-            config["recaptcha_last_refresh"] = current_time
-            save_config(config)
-        else:
-            debug_print(f"♻️ Reusing cached reCAPTCHA token (age: {int(current_time - last_refresh)}s)")
 
         debug_print("\n" + "="*80)
         debug_print("🔵 NEW API REQUEST RECEIVED")
@@ -2288,6 +2145,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         
         # Generate unique conversation ID for each request (no session continuation)
         import hashlib
+        import time
         conversation_key = f"{api_key_str}_{model_public_name}_{time.time()}_{uuid.uuid4()}"
         conversation_id = hashlib.sha256(conversation_key.encode()).hexdigest()[:16]
         
