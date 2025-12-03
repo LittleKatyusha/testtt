@@ -41,7 +41,7 @@ CHUNK_SIZE = 110000
 # Max chunks per session before rotating identity.
 # Set to 1 to revert to "Old Architecture" (New Session every chunk) - Most Reliable
 # Set to 3 to use "Hybrid Architecture" (Rotates every 3 chunks) - Stealthier
-CHUNK_ROTATION_LIMIT = 3 
+CHUNK_ROTATION_LIMIT = 5 
 
 # Set to True to reuse the same LMArena session ID for the same API Key + Model.
 # This mimics "Direct Chat" behavior and can help bypass "New Session" rate limits (422/429).
@@ -314,13 +314,13 @@ async def process_message_content(content, model_capabilities: dict) -> tuple[st
 
 app = FastAPI()
 
-# CORS
+# Configure CORS to allow requests from web-based frontends like JanitorAI
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows all origins (janitorai.com, localhost, etc.)
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all methods (GET, POST, OPTIONS, etc.)
+    allow_headers=["*"],  # Allows all headers
 )
 
 # --- Constants & Global State ---
@@ -343,6 +343,22 @@ sticky_session_ids = {}
 server_start_time = time.time()
 # Total tokens generated (approximate using tiktoken)
 total_tokens_generated = 0
+
+# --- Activity Log for Dashboard (per-request tracking) ---
+ACTIVITY_LOG_SIZE = 50
+activity_log: List[dict] = []  # Stores {timestamp, model, tokens, status}
+
+def add_activity(model: str, tokens: int, status: str = "success"):
+    """Add a request activity entry"""
+    global activity_log
+    activity_log.append({
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "model": model,
+        "tokens": tokens,
+        "status": status
+    })
+    if len(activity_log) > ACTIVITY_LOG_SIZE:
+        activity_log = activity_log[-ACTIVITY_LOG_SIZE:]
 
 # --- Log Buffer for Dashboard ---
 # Circular buffer to store recent log messages
@@ -413,6 +429,12 @@ def get_config():
     config.setdefault("default_temperature", 0.7)
     config.setdefault("default_top_p", 1.0)
     config.setdefault("default_max_tokens", 64000)
+    config.setdefault("default_presence_penalty", 0.0)
+    config.setdefault("default_frequency_penalty", 0.0)
+    
+    # Advanced Settings
+    config.setdefault("chunk_size", 110000)
+    config.setdefault("chunk_rotation_limit", 5)
     
     # Token auto-collection settings
     config.setdefault("token_collect_count", 15)
@@ -424,7 +446,18 @@ def load_usage_stats():
     """Load usage stats from config into memory"""
     global model_usage_stats
     config = get_config()
-    model_usage_stats = defaultdict(int, config.get("usage_stats", {}))
+    raw_stats = config.get("usage_stats", {})
+    
+    # Migration: Convert old int stats to new dict stats
+    migrated_stats = defaultdict(lambda: {"count": 0, "tokens": 0, "last_used": 0})
+    
+    for model, value in raw_stats.items():
+        if isinstance(value, int):
+            migrated_stats[model] = {"count": value, "tokens": 0, "last_used": 0}
+        else:
+            migrated_stats[model] = value
+            
+    model_usage_stats = migrated_stats
 
 def save_config(config):
     # Persist in-memory stats to the config dict before saving
@@ -787,10 +820,36 @@ async def get_initial_data():
                 current_title = await page.title()
                 await add_log(f"⏳ Waiting for challenge... Title: '{current_title}'", "DEBUG")
 
-                await page.wait_for_function(
-                    "() => document.title.indexOf('Just a moment...') === -1", 
-                    timeout=60000 # Increased timeout
-                )
+                # Wait for title change OR cf_clearance cookie
+                start_wait = time.time()
+                challenge_passed = False
+                
+                while time.time() - start_wait < 60:
+                    # Check title
+                    try:
+                        title = await page.title()
+                        if "Just a moment" not in title:
+                            await add_log(f"✅ Title changed to: {title}", "SUCCESS")
+                            challenge_passed = True
+                            break
+                    except:
+                        pass
+                        
+                    # Check cookie
+                    try:
+                        cookies = await page.context.cookies()
+                        if any(c['name'] == 'cf_clearance' for c in cookies):
+                            await add_log("✅ Found cf_clearance cookie!", "SUCCESS")
+                            challenge_passed = True
+                            break
+                    except:
+                        pass
+                        
+                    await asyncio.sleep(1)
+                
+                if not challenge_passed:
+                    raise Exception("Timeout waiting for challenge to complete")
+
                 await add_log("✅ Cloudflare challenge passed!", "SUCCESS")
         
                 await asyncio.sleep(4 + random.random())
@@ -890,8 +949,12 @@ async def get_initial_data():
 
 async def periodic_refresh_task():
     """Background task to refresh cf_clearance and models every 2 minutes"""
-    global active_generations
+    global active_generations, token_collection_status
     while True:
+        # Skip refresh if token collection is running to avoid interference
+        if token_collection_status.get("running", False):
+            await asyncio.sleep(30)  # Check again in 30s
+            continue
         try:
             # Wait 2 minutes (120 seconds)
             await asyncio.sleep(120)
@@ -919,12 +982,16 @@ async def startup_event():
     save_models(get_models())
     # Load usage stats from config
     load_usage_stats()
+    # Load leaderboard cache
+    load_leaderboard_cache()
     # Log startup
     await add_log("🚀 LMArena Bridge starting up...", "INFO")
     await add_log(f"📍 Dashboard: http://localhost:{PORT}/dashboard", "INFO")
     await add_log(f"📚 API Base URL: http://localhost:{PORT}/v1", "INFO")
     # Start initial data fetch
     asyncio.create_task(get_initial_data())
+    # Update leaderboard in background
+    asyncio.create_task(update_leaderboard_on_startup())
     # Start periodic refresh task (every 30 minutes)
     asyncio.create_task(periodic_refresh_task())
     await add_log("✅ Startup complete", "SUCCESS")
@@ -951,7 +1018,7 @@ async def login_page(request: Request, error: Optional[str] = None):
     if await get_current_session(request):
         return RedirectResponse(url="/dashboard")
     
-    error_msg = '<div class="error-message">❌ Invalid password. Please try again.</div>' if error else ''
+    error_msg = '<div class="error-message"><span class="error-icon">⚠️</span> Invalid password. Please try again.</div>' if error else ''
     
     return f"""
         <!DOCTYPE html>
@@ -959,139 +1026,338 @@ async def login_page(request: Request, error: Optional[str] = None):
         <head>
             <title>Login - LMArena Bridge</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <link rel="preconnect" href="https://fonts.googleapis.com">
+            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
             <style>
                 :root {{
-                    --primary: #6366f1;
-                    --primary-dark: #4f46e5;
-                    --secondary: #8b5cf6;
-                    --bg: #0f172a;
-                    --bg-card: #1e293b;
-                    --bg-input: #334155;
+                    --primary: #3b82f6;
+                    --primary-light: #60a5fa;
+                    --primary-dark: #1d4ed8;
+                    --secondary: #6366f1;
+                    --accent: #0ea5e9;
+                    --bg: #020617;
+                    --bg-card: #0a1628;
+                    --bg-input: #162033;
                     --text: #f1f5f9;
-                    --text-muted: #94a3b8;
-                    --border: #475569;
+                    --text-muted: #64748b;
+                    --text-secondary: #94a3b8;
+                    --border: #1e3a5f;
                     --danger: #ef4444;
+                    --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
                 }}
+                
                 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                
                 body {{
                     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                     background: var(--bg);
+                    background-image: 
+                        radial-gradient(ellipse at 20% 20%, rgba(59, 130, 246, 0.1) 0%, transparent 50%),
+                        radial-gradient(ellipse at 80% 80%, rgba(99, 102, 241, 0.08) 0%, transparent 50%),
+                        radial-gradient(ellipse at 50% 50%, rgba(14, 165, 233, 0.05) 0%, transparent 70%);
                     min-height: 100vh;
                     display: flex;
                     align-items: center;
                     justify-content: center;
                     padding: 20px;
+                    overflow: hidden;
                 }}
+                
+                /* Animated background particles */
+                .bg-particles {{
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    pointer-events: none;
+                    z-index: 0;
+                }}
+                
+                .particle {{
+                    position: absolute;
+                    width: 3px;
+                    height: 3px;
+                    background: var(--primary);
+                    border-radius: 50%;
+                    opacity: 0;
+                    animation: float-particle 12s infinite;
+                }}
+                
+                @keyframes float-particle {{
+                    0%, 100% {{ opacity: 0; transform: translateY(100vh) scale(0); }}
+                    10% {{ opacity: 0.5; }}
+                    90% {{ opacity: 0.5; }}
+                    100% {{ opacity: 0; transform: translateY(-100vh) scale(1); }}
+                }}
+                
                 .login-wrapper {{
                     text-align: center;
+                    position: relative;
+                    z-index: 1;
+                    animation: fadeInUp 0.8s ease;
                 }}
+                
+                @keyframes fadeInUp {{
+                    from {{
+                        opacity: 0;
+                        transform: translateY(30px);
+                    }}
+                    to {{
+                        opacity: 1;
+                        transform: translateY(0);
+                    }}
+                }}
+                
                 .logo {{
-                    font-size: 48px;
-                    margin-bottom: 16px;
+                    font-size: 64px;
+                    margin-bottom: 20px;
+                    filter: drop-shadow(0 0 30px rgba(59, 130, 246, 0.5));
+                    animation: pulse-logo 3s ease-in-out infinite;
                 }}
+                
+                @keyframes pulse-logo {{
+                    0%, 100% {{ 
+                        transform: scale(1); 
+                        filter: drop-shadow(0 0 20px rgba(59, 130, 246, 0.4));
+                    }}
+                    50% {{ 
+                        transform: scale(1.05); 
+                        filter: drop-shadow(0 0 40px rgba(59, 130, 246, 0.6));
+                    }}
+                }}
+                
                 .brand-title {{
-                    font-size: 32px;
-                    font-weight: 700;
-                    color: var(--text);
-                    margin-bottom: 8px;
+                    font-size: 36px;
+                    font-weight: 800;
+                    background: linear-gradient(135deg, #ffffff 0%, var(--primary-light) 50%, var(--accent) 100%);
+                    background-size: 200% 200%;
+                    -webkit-background-clip: text;
+                    -webkit-text-fill-color: transparent;
+                    background-clip: text;
+                    animation: gradient-shift 5s ease infinite;
+                    margin-bottom: 10px;
+                    letter-spacing: -1px;
                 }}
+                
+                @keyframes gradient-shift {{
+                    0%, 100% {{ background-position: 0% 50%; }}
+                    50% {{ background-position: 100% 50%; }}
+                }}
+                
                 .brand-subtitle {{
                     color: var(--text-muted);
-                    font-size: 14px;
-                    margin-bottom: 32px;
+                    font-size: 15px;
+                    margin-bottom: 40px;
+                    font-weight: 400;
                 }}
+                
                 .login-container {{
-                    background: var(--bg-card);
-                    padding: 40px;
-                    border-radius: 16px;
+                    background: linear-gradient(145deg, var(--bg-card) 0%, rgba(15, 29, 50, 0.8) 100%);
+                    padding: 44px;
+                    border-radius: 24px;
                     border: 1px solid var(--border);
                     width: 100%;
-                    max-width: 400px;
+                    max-width: 420px;
+                    box-shadow: 
+                        0 25px 50px -12px rgba(0, 0, 0, 0.5),
+                        0 0 50px rgba(59, 130, 246, 0.1);
+                    position: relative;
+                    overflow: hidden;
+                    backdrop-filter: blur(20px);
                 }}
+                
+                .login-container::before {{
+                    content: '';
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    height: 1px;
+                    background: linear-gradient(90deg, transparent, rgba(59, 130, 246, 0.5), transparent);
+                }}
+                
+                .login-container::after {{
+                    content: '';
+                    position: absolute;
+                    top: -50%;
+                    left: -50%;
+                    width: 200%;
+                    height: 200%;
+                    background: radial-gradient(circle, rgba(59, 130, 246, 0.03) 0%, transparent 60%);
+                    pointer-events: none;
+                }}
+                
                 h2 {{
                     color: var(--text);
                     margin-bottom: 8px;
-                    font-size: 24px;
-                    font-weight: 600;
+                    font-size: 26px;
+                    font-weight: 700;
+                    position: relative;
+                    z-index: 1;
                 }}
+                
                 .subtitle {{
-                    color: var(--text-muted);
-                    margin-bottom: 24px;
+                    color: var(--text-secondary);
+                    margin-bottom: 28px;
                     font-size: 14px;
+                    position: relative;
+                    z-index: 1;
                 }}
+                
                 .form-group {{
-                    margin-bottom: 20px;
+                    margin-bottom: 24px;
                     text-align: left;
+                    position: relative;
+                    z-index: 1;
                 }}
+                
                 label {{
                     display: block;
-                    margin-bottom: 8px;
-                    color: var(--text-muted);
-                    font-weight: 500;
+                    margin-bottom: 10px;
+                    color: var(--text-secondary);
+                    font-weight: 600;
                     font-size: 13px;
+                    text-transform: uppercase;
+                    letter-spacing: 0.5px;
                 }}
+                
                 input[type="password"] {{
                     width: 100%;
-                    padding: 14px 16px;
-                    background: var(--bg-input);
+                    padding: 16px 20px;
+                    background: linear-gradient(135deg, var(--bg) 0%, var(--bg-input) 100%);
                     border: 1px solid var(--border);
-                    border-radius: 10px;
-                    font-size: 14px;
+                    border-radius: 14px;
+                    font-size: 15px;
                     color: var(--text);
-                    transition: all 0.2s;
+                    transition: var(--transition);
+                    font-family: inherit;
                 }}
+                
                 input[type="password"]::placeholder {{
                     color: var(--text-muted);
                 }}
+                
                 input[type="password"]:focus {{
                     outline: none;
                     border-color: var(--primary);
-                    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-                }}
-                button {{
-                    width: 100%;
-                    padding: 14px;
-                    background: var(--primary);
-                    color: white;
-                    border: none;
-                    border-radius: 10px;
-                    font-size: 14px;
-                    font-weight: 600;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }}
-                button:hover {{
-                    background: var(--primary-dark);
+                    box-shadow: 
+                        0 0 0 4px rgba(59, 130, 246, 0.15),
+                        0 0 30px rgba(59, 130, 246, 0.1);
                     transform: translateY(-2px);
                 }}
-                button:active {{
-                    transform: translateY(0);
+                
+                button {{
+                    width: 100%;
+                    padding: 16px;
+                    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+                    color: white;
+                    border: none;
+                    border-radius: 14px;
+                    font-size: 15px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: var(--transition);
+                    position: relative;
+                    z-index: 1;
+                    overflow: hidden;
+                    box-shadow: 
+                        0 4px 15px rgba(59, 130, 246, 0.3),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.1);
                 }}
+                
+                button::before {{
+                    content: '';
+                    position: absolute;
+                    top: 0;
+                    left: -100%;
+                    width: 100%;
+                    height: 100%;
+                    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+                    transition: left 0.5s ease;
+                }}
+                
+                button:hover::before {{
+                    left: 100%;
+                }}
+                
+                button:hover {{
+                    background: linear-gradient(135deg, var(--primary-light) 0%, var(--primary) 100%);
+                    transform: translateY(-3px);
+                    box-shadow: 
+                        0 8px 25px rgba(59, 130, 246, 0.4),
+                        0 0 40px rgba(59, 130, 246, 0.2);
+                }}
+                
+                button:active {{
+                    transform: translateY(-1px);
+                }}
+                
                 .error-message {{
-                    background: rgba(239, 68, 68, 0.1);
+                    background: linear-gradient(135deg, rgba(239, 68, 68, 0.15) 0%, rgba(239, 68, 68, 0.1) 100%);
                     color: #fca5a5;
-                    padding: 12px 16px;
-                    border-radius: 10px;
-                    margin-bottom: 20px;
-                    border-left: 4px solid var(--danger);
+                    padding: 14px 18px;
+                    border-radius: 12px;
+                    margin-bottom: 24px;
+                    border: 1px solid rgba(239, 68, 68, 0.3);
                     font-size: 14px;
                     text-align: left;
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    animation: shake 0.5s ease;
+                    position: relative;
+                    z-index: 1;
                 }}
+                
+                .error-icon {{
+                    font-size: 18px;
+                }}
+                
+                @keyframes shake {{
+                    0%, 100% {{ transform: translateX(0); }}
+                    20%, 60% {{ transform: translateX(-5px); }}
+                    40%, 80% {{ transform: translateX(5px); }}
+                }}
+                
                 .credits {{
-                    margin-top: 24px;
+                    margin-top: 32px;
                     color: var(--text-muted);
                     font-size: 13px;
                 }}
+                
                 .credits a {{
-                    color: var(--primary);
+                    color: var(--primary-light);
                     text-decoration: none;
+                    transition: var(--transition);
+                    font-weight: 500;
                 }}
+                
                 .credits a:hover {{
-                    text-decoration: underline;
+                    color: var(--accent);
+                    text-shadow: 0 0 10px rgba(14, 165, 233, 0.5);
+                }}
+                
+                /* Mobile responsive */
+                @media (max-width: 480px) {{
+                    .login-container {{
+                        padding: 32px 24px;
+                    }}
+                    
+                    .brand-title {{
+                        font-size: 28px;
+                    }}
+                    
+                    .logo {{
+                        font-size: 48px;
+                    }}
                 }}
             </style>
         </head>
         <body>
+            <div class="bg-particles" id="particles"></div>
+            
             <div class="login-wrapper">
                 <div class="logo">🚀</div>
                 <h1 class="brand-title">LMArena Bridge</h1>
@@ -1106,14 +1372,40 @@ async def login_page(request: Request, error: Optional[str] = None):
                             <label for="password">Password</label>
                             <input type="password" id="password" name="password" placeholder="Enter your password" required autofocus>
                         </div>
-                        <button type="submit">Sign In</button>
+                        <button type="submit">
+                            <span>🔐</span> Sign In
+                        </button>
                     </form>
                 </div>
                 
                 <div class="credits">
-                    By: <a href="#">@rumoto</a> and <a href="#">@norenaboi</a>
+                    Made with ❤️ by <a href="#">@rumoto</a> and <a href="#">@norenaboi</a>
                 </div>
             </div>
+            
+            <script>
+                // Generate background particles
+                const container = document.getElementById('particles');
+                for (let i = 0; i < 25; i++) {{
+                    const particle = document.createElement('div');
+                    particle.className = 'particle';
+                    particle.style.left = Math.random() * 100 + '%';
+                    particle.style.animationDelay = Math.random() * 12 + 's';
+                    particle.style.animationDuration = (8 + Math.random() * 8) + 's';
+                    container.appendChild(particle);
+                }}
+                
+                // Focus effect on input
+                const input = document.querySelector('input[type="password"]');
+                input.addEventListener('focus', () => {{
+                    document.querySelector('.login-container').style.borderColor = 'rgba(59, 130, 246, 0.5)';
+                    document.querySelector('.login-container').style.boxShadow = '0 25px 50px -12px rgba(0, 0, 0, 0.5), 0 0 60px rgba(59, 130, 246, 0.2)';
+                }});
+                input.addEventListener('blur', () => {{
+                    document.querySelector('.login-container').style.borderColor = '';
+                    document.querySelector('.login-container').style.boxShadow = '';
+                }});
+            </script>
         </body>
         </html>
     """
@@ -1199,24 +1491,30 @@ async def dashboard(session: str = Depends(get_current_session)):
         for idx, token in enumerate(auth_tokens):
             token_preview = f"{token[:20]}...{token[-10:]}" if len(token) > 30 else token
             tokens_html += f"""
-                <tr>
-                    <td><strong>Token {idx + 1}</strong></td>
-                    <td><code class="api-key-code">{token_preview}</code></td>
-                    <td>
-                        <form action='/delete-token' method='post' style='margin:0;' onsubmit='return confirm("Delete this auth token?");'>
-                            <input type='hidden' name='token_index' value='{idx}'>
-                            <button type='submit' class='btn btn-danger'>Delete</button>
-                        </form>
-                    </td>
-                </tr>
+                <div class="token-item" style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; background: var(--bg-dark); border-radius: 12px; margin-bottom: 10px; border: 1px solid var(--border); transition: all 0.2s ease;">
+                    <div style="display: flex; align-items: center; gap: 14px; flex: 1; min-width: 0;">
+                        <div class="token-index" style="width: 32px; height: 32px; background: linear-gradient(135deg, var(--primary), var(--primary-dark)); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; color: white; flex-shrink: 0;">
+                            {idx + 1}
+                        </div>
+                        <div style="flex: 1; min-width: 0;">
+                            <code style="font-family: 'Monaco', 'Consolas', monospace; font-size: 12px; color: var(--text-muted); background: var(--bg-darker); padding: 6px 10px; border-radius: 6px; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{token_preview}</code>
+                        </div>
+                    </div>
+                    <form action='/delete-token' method='post' style='margin: 0; margin-left: 12px;' onsubmit='return confirm("Delete Token #{idx + 1}?");'>
+                        <input type='hidden' name='token_index' value='{idx}'>
+                        <button type='submit' class='btn btn-danger' style='padding: 8px 12px; font-size: 12px; min-width: auto;'>
+                            🗑️
+                        </button>
+                    </form>
+                </div>
             """
     else:
-        tokens_html = '<tr><td colspan="3" class="no-data">No auth tokens configured</td></tr>'
+        tokens_html = '<div style="text-align: center; padding: 40px 20px; color: var(--text-muted);"><div style="font-size: 48px; margin-bottom: 16px; opacity: 0.5;">🔑</div><p>No auth tokens configured</p><p style="font-size: 13px;">Click "Add Token" to get started</p></div>'
 
-    # Render Models (limit to first 20 with text output)
+    # Render Models (limit to first 30 with text output)
     text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
     models_html = ""
-    for i, model in enumerate(text_models[:20]):
+    for i, model in enumerate(text_models[:30]):
         rank = model.get('rank', '?')
         org = model.get('organization', 'Unknown')
         models_html += f"""
@@ -1235,10 +1533,39 @@ async def dashboard(session: str = Depends(get_current_session)):
     # Render Stats
     stats_html = ""
     if model_usage_stats:
-        for model, count in sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
-            stats_html += f"<tr><td>{model}</td><td><strong>{count}</strong></td></tr>"
+        # Sort by count descending
+        sorted_stats = sorted(model_usage_stats.items(), key=lambda x: x[1]["count"] if isinstance(x[1], dict) else x[1], reverse=True)
+        
+        for model, data in sorted_stats[:30]:
+            # Handle legacy int data gracefully
+            if isinstance(data, int):
+                count = data
+                tokens = 0
+                last_used = "Unknown"
+            else:
+                count = data.get("count", 0)
+                tokens = data.get("tokens", 0)
+                ts = data.get("last_used", 0)
+                last_used = time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)) if ts > 0 else "Never"
+            
+            # Format tokens
+            if tokens >= 1_000_000:
+                tokens_str = f"{tokens/1_000_000:.1f}M"
+            elif tokens >= 1_000:
+                tokens_str = f"{tokens/1_000:.1f}K"
+            else:
+                tokens_str = str(tokens)
+                
+            stats_html += f"""
+                <tr>
+                    <td>{model}</td>
+                    <td><strong>{count}</strong></td>
+                    <td>{tokens_str}</td>
+                    <td><small>{last_used}</small></td>
+                </tr>
+            """
     else:
-        stats_html = "<tr><td colspan='2' class='no-data'>No usage data yet</td></tr>"
+        stats_html = "<tr><td colspan='4' class='no-data'>No usage data yet</td></tr>"
 
     # Check token status
     token_status = "✅ Configured" if config.get("auth_token") else "❌ Not Set"
@@ -1251,1388 +1578,2973 @@ async def dashboard(session: str = Depends(get_current_session)):
     default_temp = config.get("default_temperature", 0.7)
     default_top_p = config.get("default_top_p", 1.0)
     default_max_tokens = config.get("default_max_tokens", 64000)
+    default_pres_pen = config.get("default_presence_penalty", 0.0)
+    default_freq_pen = config.get("default_frequency_penalty", 0.0)
+    
+    # Advanced settings
+    chunk_size = config.get("chunk_size", 110000)
+    chunk_rotation_limit = config.get("chunk_rotation_limit", 5)
     
     # Get recent activity count (last 24 hours)
-    recent_activity = sum(1 for timestamps in api_key_usage.values() for t in timestamps if time.time() - t < 86400)
+    recent_activity_count = sum(1 for timestamps in api_key_usage.values() for t in timestamps if time.time() - t < 86400)
+    
+    # Generate recent activity HTML from activity_log (per-request tracking)
+    recent_activity_html = ""
+    if activity_log:
+        # Show most recent activities first
+        for entry in reversed(activity_log[-10:]):
+            tokens = entry.get("tokens", 0)
+            if tokens >= 1_000_000:
+                tokens_str = f"{tokens/1_000_000:.1f}M"
+            elif tokens >= 1_000:
+                tokens_str = f"{tokens/1_000:.1f}K"
+            else:
+                tokens_str = str(tokens)
+            
+            status_class = "var(--success)" if entry.get("status") == "success" else "var(--error)"
+            status_text = "✓ Success" if entry.get("status") == "success" else "✗ Failed"
+            status_bg = "var(--success-glow)" if entry.get("status") == "success" else "var(--error-glow)"
+                
+            recent_activity_html += f"""
+                <tr>
+                    <td>{entry.get('timestamp', 'N/A')}</td>
+                    <td>{entry.get('model', 'Unknown')}</td>
+                    <td>{tokens_str}</td>
+                    <td><span class="badge" style="background: {status_bg}; color: {status_class};">{status_text}</span></td>
+                </tr>
+            """
+    
+    if not recent_activity_html:
+        recent_activity_html = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 24px;">No recent activity</td></tr>'
+
+    # Calculate total tokens across all models
+    total_tokens = sum(v.get("tokens", 0) if isinstance(v, dict) else 0 for v in model_usage_stats.values())
+    if total_tokens >= 1_000_000:
+        total_tokens_str = f"{total_tokens/1_000_000:.2f}M"
+    elif total_tokens >= 1_000:
+        total_tokens_str = f"{total_tokens/1_000:.1f}K"
+    else:
+        total_tokens_str = str(total_tokens)
+
+    # Prepare chart data safely
+    chart_data = {}
+    for k, v in model_usage_stats.items():
+        if isinstance(v, dict):
+            chart_data[k] = v.get("count", 0)
+        else:
+            chart_data[k] = v
+    
+    top_models = dict(sorted(chart_data.items(), key=lambda x: x[1], reverse=True)[:30])
+
+    # Prepare variables for template
+    total_requests = sum(v.get("count", 0) if isinstance(v, dict) else v for v in model_usage_stats.values())
+    api_keys = config.get("api_keys", [])
+    uptime_str = get_uptime_string()
+    auth_tokens_str = "\n".join(config.get("auth_tokens", []))
 
     return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Dashboard - LMArena Bridge</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
-            <style>
-                :root {{
-                    --primary: #6366f1;
-                    --primary-dark: #4f46e5;
-                    --secondary: #8b5cf6;
-                    --success: #10b981;
-                    --warning: #f59e0b;
-                    --danger: #ef4444;
-                    --bg: #0f172a;
-                    --bg-card: #1e293b;
-                    --bg-input: #334155;
-                    --text: #f1f5f9;
-                    --text-muted: #94a3b8;
-                    --border: #475569;
-                }}
-                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                body {{
-                    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    background: var(--bg);
-                    color: var(--text);
-                    line-height: 1.6;
-                    min-height: 100vh;
-                }}
-                
-                /* Layout */
-                .layout {{
-                    display: grid;
-                    grid-template-columns: 260px 1fr;
-                    min-height: 100vh;
-                }}
-                
-                /* Sidebar */
-                .sidebar {{
-                    background: var(--bg-card);
-                    border-right: 1px solid var(--border);
-                    padding: 24px;
-                    position: sticky;
-                    top: 0;
-                    height: 100vh;
-                    overflow-y: auto;
-                }}
-                .logo {{
-                    font-size: 20px;
-                    font-weight: 700;
-                    color: var(--text);
-                    margin-bottom: 32px;
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                }}
-                .nav-section {{
-                    margin-bottom: 24px;
-                }}
-                .nav-label {{
-                    font-size: 11px;
-                    text-transform: uppercase;
-                    color: var(--text-muted);
-                    letter-spacing: 1px;
-                    margin-bottom: 12px;
-                }}
-                .nav-link {{
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                    padding: 10px 12px;
-                    border-radius: 8px;
-                    color: var(--text-muted);
-                    text-decoration: none;
-                    font-size: 14px;
-                    transition: all 0.2s;
-                    cursor: pointer;
-                }}
-                .nav-link:hover, .nav-link.active {{
-                    background: var(--primary);
-                    color: white;
-                }}
-                .nav-link svg {{
-                    width: 18px;
-                    height: 18px;
-                }}
-                
-                /* Main Content */
-                .main {{
-                    padding: 32px;
-                    overflow-y: auto;
-                }}
-                .page-header {{
-                    margin-bottom: 32px;
-                }}
-                .page-title {{
-                    font-size: 28px;
-                    font-weight: 700;
-                    margin-bottom: 8px;
-                }}
-                .page-subtitle {{
-                    color: var(--text-muted);
-                    font-size: 14px;
-                }}
-                
-                /* Stats Grid */
-                .stats-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                    gap: 20px;
-                    margin-bottom: 32px;
-                }}
-                .stat-card {{
-                    background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
-                    padding: 24px;
-                    border-radius: 16px;
-                    position: relative;
-                    overflow: hidden;
-                }}
-                .stat-card::before {{
-                    content: '';
-                    position: absolute;
-                    top: -50%;
-                    right: -50%;
-                    width: 100%;
-                    height: 100%;
-                    background: rgba(255,255,255,0.1);
-                    border-radius: 50%;
-                }}
-                .stat-value {{
-                    font-size: 36px;
-                    font-weight: 700;
-                    margin-bottom: 4px;
-                }}
-                .stat-label {{
-                    font-size: 14px;
-                    opacity: 0.9;
-                }}
-                
-                /* Cards */
-                .card {{
-                    background: var(--bg-card);
-                    border-radius: 16px;
-                    border: 1px solid var(--border);
-                    margin-bottom: 24px;
-                    overflow: hidden;
-                }}
-                .card-header {{
-                    padding: 20px 24px;
-                    border-bottom: 1px solid var(--border);
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                }}
-                .card-title {{
-                    font-size: 16px;
-                    font-weight: 600;
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                }}
-                .card-body {{
-                    padding: 24px;
-                }}
-                
-                /* Grid layouts */
-                .grid-2 {{
-                    display: grid;
-                    grid-template-columns: repeat(2, 1fr);
-                    gap: 24px;
-                }}
-                .grid-3 {{
-                    display: grid;
-                    grid-template-columns: repeat(3, 1fr);
-                    gap: 16px;
-                }}
-                .grid-4 {{
-                    display: grid;
-                    grid-template-columns: repeat(4, 1fr);
-                    gap: 16px;
-                }}
-                
-                /* Forms */
-                .form-group {{
-                    margin-bottom: 20px;
-                }}
-                .form-label {{
-                    display: block;
-                    margin-bottom: 8px;
-                    font-size: 13px;
-                    font-weight: 500;
-                    color: var(--text-muted);
-                }}
-                .form-input {{
-                    width: 100%;
-                    padding: 12px 16px;
-                    background: var(--bg-input);
-                    border: 1px solid var(--border);
-                    border-radius: 10px;
-                    color: var(--text);
-                    font-size: 14px;
-                    transition: all 0.2s;
-                }}
-                .form-input:focus {{
-                    outline: none;
-                    border-color: var(--primary);
-                    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-                }}
-                .form-input::placeholder {{
-                    color: var(--text-muted);
-                }}
-                textarea.form-input {{
-                    resize: vertical;
-                    min-height: 100px;
-                    font-family: 'JetBrains Mono', monospace;
-                }}
-                .form-hint {{
-                    font-size: 12px;
-                    color: var(--text-muted);
-                    margin-top: 6px;
-                }}
-                .form-row {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-                    gap: 16px;
-                    align-items: end;
-                }}
-                
-                /* Buttons */
-                .btn {{
-                    padding: 12px 24px;
-                    border: none;
-                    border-radius: 10px;
-                    font-size: 14px;
-                    font-weight: 600;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 8px;
-                }}
-                .btn-primary {{
-                    background: var(--primary);
-                    color: white;
-                }}
-                .btn-primary:hover {{
-                    background: var(--primary-dark);
-                    transform: translateY(-2px);
-                }}
-                .btn-success {{
-                    background: var(--success);
-                    color: white;
-                }}
-                .btn-success:hover {{
-                    filter: brightness(1.1);
-                }}
-                .btn-danger {{
-                    background: var(--danger);
-                    color: white;
-                    padding: 8px 16px;
-                    font-size: 13px;
-                }}
-                .btn-danger:hover {{
-                    filter: brightness(1.1);
-                }}
-                
-                /* Tables */
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                }}
-                th {{
-                    text-align: left;
-                    padding: 12px 16px;
-                    font-size: 12px;
-                    text-transform: uppercase;
-                    letter-spacing: 0.5px;
-                    color: var(--text-muted);
-                    border-bottom: 1px solid var(--border);
-                }}
-                td {{
-                    padding: 16px;
-                    border-bottom: 1px solid var(--border);
-                }}
-                tr:last-child td {{
-                    border-bottom: none;
-                }}
-                tr:hover {{
-                    background: rgba(255,255,255,0.02);
-                }}
-                
-                /* Badges */
-                .badge {{
-                    display: inline-block;
-                    padding: 4px 10px;
-                    border-radius: 6px;
-                    font-size: 12px;
-                    font-weight: 600;
-                }}
-                .badge-primary {{
-                    background: rgba(99, 102, 241, 0.2);
-                    color: #a5b4fc;
-                }}
-                .badge-success {{
-                    background: rgba(16, 185, 129, 0.2);
-                    color: #6ee7b7;
-                }}
-                .badge-warning {{
-                    background: rgba(245, 158, 11, 0.2);
-                    color: #fcd34d;
-                }}
-                
-                /* Code */
-                .api-key-code {{
-                    font-family: 'JetBrains Mono', monospace;
-                    font-size: 12px;
-                    background: var(--bg);
-                    padding: 6px 10px;
-                    border-radius: 6px;
-                    color: #a5b4fc;
-                }}
-                
-                /* Model Grid */
-                .model-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-                    gap: 12px;
-                }}
-                .model-card {{
-                    background: var(--bg);
-                    padding: 16px;
-                    border-radius: 12px;
-                    border: 1px solid var(--border);
-                    transition: all 0.2s;
-                }}
-                .model-card:hover {{
-                    border-color: var(--primary);
-                    transform: translateY(-2px);
-                }}
-                .model-header {{
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: flex-start;
-                    margin-bottom: 8px;
-                }}
-                .model-name {{
-                    font-size: 13px;
-                    font-weight: 600;
-                    color: var(--text);
-                    word-break: break-word;
-                }}
-                .model-rank {{
-                    background: var(--primary);
-                    color: white;
-                    padding: 2px 8px;
-                    border-radius: 10px;
-                    font-size: 10px;
-                    font-weight: 600;
-                    white-space: nowrap;
-                }}
-                .model-org {{
-                    color: var(--text-muted);
-                    font-size: 12px;
-                }}
-                
-                /* Slider Styles */
-                .slider-container {{
-                    display: flex;
-                    align-items: center;
-                    gap: 16px;
-                }}
-                .slider {{
-                    flex: 1;
-                    -webkit-appearance: none;
-                    height: 6px;
-                    border-radius: 3px;
-                    background: var(--bg);
-                    outline: none;
-                }}
-                .slider::-webkit-slider-thumb {{
-                    -webkit-appearance: none;
-                    width: 20px;
-                    height: 20px;
-                    border-radius: 50%;
-                    background: var(--primary);
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }}
-                .slider::-webkit-slider-thumb:hover {{
-                    transform: scale(1.2);
-                    box-shadow: 0 0 10px var(--primary);
-                }}
-                .slider-value {{
-                    min-width: 70px;
-                    text-align: right;
-                    font-family: 'JetBrains Mono', monospace;
-                    font-size: 14px;
-                    color: var(--primary);
-                    font-weight: 600;
-                }}
-                
-                /* Section visibility */
-                .section {{
-                    display: none;
-                }}
-                .section.active {{
-                    display: block;
-                }}
-                
-                /* No data */
-                .no-data {{
-                    text-align: center;
-                    padding: 40px;
-                    color: var(--text-muted);
-                }}
-                
-                /* Charts container */
-                .chart-container {{
-                    position: relative;
-                    height: 250px;
-                }}
-                
-                /* Toast notification */
-                .toast {{
-                    position: fixed;
-                    bottom: 24px;
-                    right: 24px;
-                    background: var(--success);
-                    color: white;
-                    padding: 16px 24px;
-                    border-radius: 12px;
-                    font-weight: 500;
-                    animation: slideUp 0.3s ease;
-                    z-index: 1000;
-                }}
-                @keyframes slideUp {{
-                    from {{ transform: translateY(100px); opacity: 0; }}
-                    to {{ transform: translateY(0); opacity: 1; }}
-                }}
-                
-                /* Responsive */
-                .mobile-nav-toggle {{
-                    display: none;
-                    position: fixed;
-                    bottom: 20px;
-                    right: 20px;
-                    z-index: 1001;
-                    background: var(--primary);
-                    color: white;
-                    border: none;
-                    border-radius: 50%;
-                    width: 56px;
-                    height: 56px;
-                    font-size: 24px;
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-                    cursor: pointer;
-                    align-items: center;
-                    justify-content: center;
-                }}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <title>LMArena Bridge</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {{
+            --bg-dark: #020617;
+            --bg-darker: #010409;
+            --bg-card: #0a1628;
+            --bg-card-hover: #0f1d32;
+            --bg-hover: #162033;
+            --border: #1e3a5f;
+            --border-light: #2a4a6f;
+            --primary: #3b82f6;
+            --primary-light: #60a5fa;
+            --primary-dark: #1d4ed8;
+            --primary-glow: rgba(59, 130, 246, 0.4);
+            --secondary: #6366f1;
+            --secondary-glow: rgba(99, 102, 241, 0.3);
+            --accent: #0ea5e9;
+            --accent-glow: rgba(14, 165, 233, 0.3);
+            --success: #10b981;
+            --success-glow: rgba(16, 185, 129, 0.3);
+            --warning: #f59e0b;
+            --warning-glow: rgba(245, 158, 11, 0.3);
+            --error: #ef4444;
+            --error-glow: rgba(239, 68, 68, 0.3);
+            --text-main: #f1f5f9;
+            --text-secondary: #cbd5e1;
+            --text-muted: #64748b;
+            --sidebar-width: 280px;
+            --header-height: 72px;
+            --transition-fast: 0.15s;
+            --transition-normal: 0.25s;
+            --transition-slow: 0.4s;
+            --ease-bounce: cubic-bezier(0.68, -0.55, 0.265, 1.55);
+            --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+        }}
 
-                .sidebar-overlay {{
-                    display: none;
-                    position: fixed;
-                    top: 0;
-                    left: 0;
-                    width: 100%;
-                    height: 100%;
-                    background: rgba(0,0,0,0.5);
-                    z-index: 999;
-                    backdrop-filter: blur(2px);
-                }}
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        }}
 
-                @media (max-width: 1024px) {{
-                    .layout {{
-                        grid-template-columns: 1fr;
-                    }}
-                    .sidebar {{
-                        position: fixed;
-                        left: -280px;
-                        top: 0;
-                        height: 100vh;
-                        width: 280px;
-                        z-index: 1000;
-                        transition: left 0.3s ease;
-                        box-shadow: 4px 0 24px rgba(0,0,0,0.5);
-                    }}
-                    .sidebar.open {{
-                        left: 0;
-                    }}
-                    .sidebar-overlay.open {{
-                        display: block;
-                    }}
-                    .mobile-nav-toggle {{
-                        display: flex;
-                    }}
-                    .main {{
-                        padding: 20px;
-                    }}
-                    .grid-2, .grid-3, .grid-4 {{
-                        grid-template-columns: 1fr;
-                    }}
-                    .stats-grid {{
-                        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-                        gap: 12px;
-                    }}
-                    .stat-value {{
-                        font-size: 28px;
-                    }}
-                    
-                    /* Table responsiveness */
-                    .table-responsive {{
-                        overflow-x: auto;
-                        -webkit-overflow-scrolling: touch;
-                    }}
-                    table {{
-                        min-width: 600px; /* Force scroll on small screens */
-                    }}
-                }}
-            </style>
-            <script>
-                function toggleSidebar() {{
-                    document.querySelector('.sidebar').classList.toggle('open');
-                    document.querySelector('.sidebar-overlay').classList.toggle('open');
-                }}
-                
-                // Close sidebar when clicking a link on mobile
-                document.addEventListener('DOMContentLoaded', () => {{
-                    const links = document.querySelectorAll('.nav-link');
-                    links.forEach(link => {{
-                        link.addEventListener('click', () => {{
-                            if (window.innerWidth <= 1024) {{
-                                toggleSidebar();
-                            }}
-                        }});
-                    }});
-                }});
-            </script>
-        </head>
-        <body>
-            <div class="sidebar-overlay" onclick="toggleSidebar()"></div>
-            <button class="mobile-nav-toggle" onclick="toggleSidebar()">☰</button>
-            <div class="layout">
-                <!-- Sidebar -->
-                <aside class="sidebar">
-                    <div class="logo">
-                        <span>🚀</span> LMArena Bridge
-                    </div>
-                    
-                    <nav>
-                        <div class="nav-section">
-                            <div class="nav-label">Dashboard</div>
-                            <a class="nav-link active" onclick="showSection('overview')">
-                                <span>📊</span> Overview
-                            </a>
-                        </div>
-                        
-                        <div class="nav-section">
-                            <div class="nav-label">Configuration</div>
-                            <a class="nav-link" onclick="showSection('generation')">
-                                <span>⚙️</span> Generation Settings
-                            </a>
-                            <a class="nav-link" onclick="showSection('auth')">
-                                <span>🔐</span> Arena Auth
-                            </a>
-                            <a class="nav-link" onclick="showSection('apikeys')">
-                                <span>🔑</span> API Keys
-                            </a>
-                        </div>
-                        
-                        <div class="nav-section">
-                            <div class="nav-label">Data</div>
-                            <a class="nav-link" onclick="showSection('models')">
-                                <span>🤖</span> Models
-                            </a>
-                            <a class="nav-link" onclick="showSection('stats')">
-                                <span>📈</span> Statistics
-                            </a>
-                            <a class="nav-link" onclick="showSection('logs')">
-                                <span>📜</span> Live Logs
-                            </a>
-                        </div>
-                        
-                        <div class="nav-section">
-                            <div class="nav-label">System</div>
-                            <a class="nav-link" onclick="showSection('settings')">
-                                <span>🛠️</span> Settings
-                            </a>
-                        </div>
-                        
-                        <div class="nav-section" style="margin-top: auto; padding-top: 24px; border-top: 1px solid var(--border);">
-                            <a href="/logout" class="nav-link">
-                                <span>🚪</span> Logout
-                            </a>
-                        </div>
-                    </nav>
-                </aside>
-                
-                <!-- Main Content -->
-                <main class="main">
-                    <!-- Overview Section -->
-                    <div id="section-overview" class="section active">
-                        <div class="page-header">
-                            <h1 class="page-title">Dashboard Overview</h1>
-                            <p class="page-subtitle">Monitor your LMArena Bridge instance</p>
-                        </div>
-                        
-                        <div class="stats-grid">
-                            <div class="stat-card">
-                                <div class="stat-value">{get_uptime_string()}</div>
-                                <div class="stat-label">⏱️ Server Uptime</div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-value">{sum(model_usage_stats.values())}</div>
-                                <div class="stat-label">📊 Total Requests</div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-value">{format_tokens(total_tokens_generated)}</div>
-                                <div class="stat-label">🔤 Tokens Generated</div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-value">{len(text_models)}</div>
-                                <div class="stat-label">🤖 Available Models</div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-value">{len(auth_tokens)}</div>
-                                <div class="stat-label">🔐 Auth Tokens</div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-value">{len(config['api_keys'])}</div>
-                                <div class="stat-label">🔑 API Keys</div>
-                            </div>
-                        </div>
-                        
-                        <div class="grid-2">
-                            <div class="card">
-                                <div class="card-header">
-                                    <span class="card-title">☁️ Cloudflare Status</span>
-                                    <span class="badge {'badge-success' if config.get('cf_clearance') else 'badge-warning'}">{cf_status}</span>
-                                </div>
-                                <div class="card-body">
-                                    <code class="api-key-code" style="display: block; word-break: break-all; padding: 12px;">
-                                        {config.get("cf_clearance", "Not set")[:80]}...
-                                    </code>
-                                    <form action="/refresh-tokens" method="post" style="margin-top: 16px;">
-                                        <button type="submit" class="btn btn-success">🔄 Refresh Tokens & Models</button>
-                                    </form>
-                                </div>
-                            </div>
-                            
-                            <div class="card">
-                                <div class="card-header">
-                                    <span class="card-title">⚙️ Current Generation Defaults</span>
-                                </div>
-                                <div class="card-body">
-                                    <div class="grid-3">
-                                        <div style="text-align: center; padding: 16px; background: var(--bg); border-radius: 12px;">
-                                            <div style="font-size: 24px; font-weight: 700; color: var(--primary);">{default_temp}</div>
-                                            <div style="font-size: 12px; color: var(--text-muted);">Temperature</div>
-                                        </div>
-                                        <div style="text-align: center; padding: 16px; background: var(--bg); border-radius: 12px;">
-                                            <div style="font-size: 24px; font-weight: 700; color: var(--primary);">{default_top_p}</div>
-                                            <div style="font-size: 12px; color: var(--text-muted);">Top P</div>
-                                        </div>
-                                        <div style="text-align: center; padding: 16px; background: var(--bg); border-radius: 12px;">
-                                            <div style="font-size: 24px; font-weight: 700; color: var(--primary);">{default_max_tokens:,}</div>
-                                            <div style="font-size: 12px; color: var(--text-muted);">Max Tokens</div>
-                                        </div>
-                                    </div>
-                                    <p style="margin-top: 16px; font-size: 13px; color: var(--text-muted);">
-                                        💡 Frontend apps (SillyTavern, etc.) can override these per-request
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- Generation Settings Section -->
-                    <div id="section-generation" class="section">
-                        <div class="page-header">
-                            <h1 class="page-title">Generation Settings</h1>
-                            <p class="page-subtitle">Configure default parameters for text generation</p>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">⚙️ Default Parameters</span>
-                            </div>
-                            <div class="card-body">
-                                <form action="/update-generation-settings" method="post">
-                                    <div class="form-group">
-                                        <label class="form-label">🌡️ Temperature</label>
-                                        <div class="slider-container">
-                                            <input type="range" class="slider" id="temperature" name="temperature" 
-                                                min="0" max="2" step="0.1" value="{default_temp}"
-                                                oninput="document.getElementById('temp-value').textContent = this.value">
-                                            <span class="slider-value" id="temp-value">{default_temp}</span>
-                                        </div>
-                                        <p class="form-hint">Controls randomness. Lower = more focused, Higher = more creative (0.0 - 2.0)</p>
-                                    </div>
-                                    
-                                    <div class="form-group">
-                                        <label class="form-label">🎯 Top P (Nucleus Sampling)</label>
-                                        <div class="slider-container">
-                                            <input type="range" class="slider" id="top_p" name="top_p" 
-                                                min="0" max="1" step="0.05" value="{default_top_p}"
-                                                oninput="document.getElementById('topp-value').textContent = this.value">
-                                            <span class="slider-value" id="topp-value">{default_top_p}</span>
-                                        </div>
-                                        <p class="form-hint">Controls diversity. 1.0 = consider all tokens, 0.1 = consider only top 10% (0.0 - 1.0)</p>
-                                    </div>
-                                    
-                                    <div class="form-group">
-                                        <label class="form-label">📝 Max Output Tokens</label>
-                                        <input type="number" class="form-input" id="max_tokens" name="max_tokens" 
-                                            value="{default_max_tokens}" min="1" max="128000" style="max-width: 300px;">
-                                        <p class="form-hint">Maximum tokens to generate. Set high (64000+) for long outputs. Models may have lower limits.</p>
-                                    </div>
-                                    
-                                    <div style="display: flex; gap: 12px; margin-top: 24px;">
-                                        <button type="submit" class="btn btn-primary">💾 Save Settings</button>
-                                        <button type="button" class="btn" style="background: var(--bg);" 
-                                            onclick="resetDefaults()">↩️ Reset to Defaults</button>
-                                    </div>
-                                </form>
-                                
-                                <div style="margin-top: 32px; padding: 20px; background: var(--bg); border-radius: 12px; border-left: 4px solid var(--primary);">
-                                    <h4 style="margin-bottom: 12px; font-size: 14px;">📌 How It Works</h4>
-                                    <ul style="color: var(--text-muted); font-size: 13px; padding-left: 20px;">
-                                        <li>These are <strong>default</strong> values used when the frontend doesn't specify them</li>
-                                        <li>SillyTavern and other frontends can override these per-request</li>
-                                        <li>If your frontend sends temperature=0.9, that will be used instead</li>
-                                        <li>Set max_tokens high to allow long outputs (model-dependent)</li>
-                                    </ul>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- Auth Section -->
-                    <div id="section-auth" class="section">
-                        <div class="page-header">
-                            <h1 class="page-title">Arena Authentication</h1>
-                            <p class="page-subtitle">Manage your LMArena authentication tokens</p>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">🔐 Auth Tokens</span>
-                                <div style="display: flex; align-items: center; gap: 12px;">
-                                    <span class="badge badge-primary">{len(auth_tokens)} Token(s)</span>
-                                    <form action="/delete-all-tokens" method="post" style="margin: 0;" onsubmit="return confirm('Are you sure you want to delete ALL auth tokens? This cannot be undone.');">
-                                        <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;">🗑️ Delete All</button>
-                                    </form>
-                                </div>
-                            </div>
-                            <div class="card-body">
-                                <div class="table-responsive">
-                                    <table>
-                                        <thead>
-                                            <tr>
-                                                <th>Name</th>
-                                                <th>Token</th>
-                                                <th>Action</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {tokens_html}
-                                        </tbody>
-                                    </table>
-                                </div>
-                                
-                                <div style="margin-top: 32px;">
-                                    <h4 style="margin-bottom: 16px;">➕ Add Tokens Manually</h4>
-                                    <form action="/update-auth-tokens" method="post">
-                                        <div class="form-group">
-                                            <label class="form-label">Arena Auth Tokens (one per line)</label>
-                                            <textarea class="form-input" name="auth_tokens" rows="4" 
-                                                placeholder="Paste your arena-auth-prod-v1 tokens here (one per line)"></textarea>
-                                            <p class="form-hint">Add multiple tokens to distribute requests and avoid rate limits</p>
-                                        </div>
-                                        <button type="submit" class="btn btn-primary">Add Tokens</button>
-                                    </form>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- Auto Collection Card -->
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">🤖 Auto-Collect Tokens</span>
-                                <span class="badge" id="collection-badge" style="background: var(--bg); color: var(--text-muted);">Idle</span>
-                            </div>
-                            <div class="card-body">
-                                <p style="color: var(--text-muted); margin-bottom: 20px;">
-                                    Automatically collect authentication tokens using the browser. This will navigate to LMArena, 
-                                    capture the auth cookie, clear cookies, and repeat to collect unique tokens.
-                                </p>
-                                
-                                <div class="form-row" style="margin-bottom: 20px;">
-                                    <div class="form-group">
-                                        <label class="form-label">Tokens to Collect</label>
-                                        <input type="number" class="form-input" id="collect-count" value="{config.get('token_collect_count', 15)}" min="1" max="50">
-                                    </div>
-                                    <div class="form-group">
-                                        <label class="form-label">Delay Between (seconds)</label>
-                                        <input type="number" class="form-input" id="collect-delay" value="{config.get('token_collect_delay', 5)}" min="1" max="60">
-                                    </div>
-                                </div>
-                                
-                                <!-- Progress Bar -->
-                                <div style="margin-bottom: 20px;">
-                                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
-                                        <span style="font-size: 13px; color: var(--text-muted);">Progress</span>
-                                        <span id="progress-text" style="font-size: 13px; color: var(--text-muted);">0 / 0</span>
-                                    </div>
-                                    <div style="background: var(--bg); height: 8px; border-radius: 4px; overflow: hidden;">
-                                        <div id="progress-bar" style="background: var(--primary); height: 100%; width: 0%; transition: width 0.3s;"></div>
-                                    </div>
-                                </div>
-                                
-                                <!-- Status -->
-                                <div style="background: var(--bg); padding: 12px 16px; border-radius: 8px; margin-bottom: 20px;">
-                                    <span style="font-size: 13px; color: var(--text-muted);">Status: </span>
-                                    <span id="collection-status" style="font-size: 13px;">Idle</span>
-                                </div>
-                                
-                                <!-- Buttons -->
-                                <div style="display: flex; gap: 12px;">
-                                    <button id="start-collection-btn" class="btn btn-primary" onclick="startCollection()">
-                                        🚀 Start Collection
-                                    </button>
-                                    <button id="stop-collection-btn" class="btn btn-danger" onclick="stopCollection()" style="display: none;">
-                                        ⏹️ Stop Collection
-                                    </button>
-                                </div>
-                                
-                                <div style="margin-top: 20px; padding: 16px; background: var(--bg); border-radius: 8px; border-left: 4px solid var(--warning);">
-                                    <h4 style="margin-bottom: 8px; font-size: 14px; color: var(--warning);">⚠️ Important Notes</h4>
-                                    <ul style="color: var(--text-muted); font-size: 13px; padding-left: 20px; margin: 0;">
-                                        <li>This uses the browser instance, so other operations may be paused</li>
-                                        <li>Each token requires a page load cycle (~5-10 seconds)</li>
-                                        <li>Tokens are saved automatically to your config</li>
-                                        <li>Duplicate tokens are automatically skipped</li>
-                                    </ul>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- API Keys Section -->
-                    <div id="section-apikeys" class="section">
-                        <div class="page-header">
-                            <h1 class="page-title">API Keys</h1>
-                            <p class="page-subtitle">Manage access keys for your proxy</p>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">🔑 Active Keys</span>
-                            </div>
-                            <div class="card-body">
-                                <div class="table-responsive">
-                                    <table>
-                                        <thead>
-                                            <tr>
-                                                <th>Name</th>
-                                                <th>Key</th>
-                                                <th>RPM</th>
-                                                <th>RPD</th>
-                                                <th>Created</th>
-                                                <th>Action</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {keys_html if keys_html else '<tr><td colspan="6" class="no-data">No API keys configured</td></tr>'}
-                                        </tbody>
-                                    </table>
-                                </div>
-                                
-                                <div style="margin-top: 32px;">
-                                    <h4 style="margin-bottom: 16px;">➕ Create New API Key</h4>
-                                    <form action="/create-key" method="post">
-                                        <div class="form-row">
-                                            <div class="form-group">
-                                                <label class="form-label">Key Name</label>
-                                                <input type="text" class="form-input" name="name" placeholder="e.g., Production Key" required>
-                                            </div>
-                                            <div class="form-group">
-                                                <label class="form-label">Rate Limit (RPM)</label>
-                                                <input type="number" class="form-input" name="rpm" value="60" min="1" max="1000" required>
-                                            </div>
-                                            <div class="form-group">
-                                                <label class="form-label">Daily Limit (RPD)</label>
-                                                <input type="number" class="form-input" name="rpd" value="10000" min="1" required>
-                                            </div>
-                                            <div class="form-group">
-                                                <label class="form-label">&nbsp;</label>
-                                                <button type="submit" class="btn btn-primary">Create Key</button>
-                                            </div>
-                                        </div>
-                                    </form>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- Models Section -->
-                    <div id="section-models" class="section">
-                        <div class="page-header">
-                            <h1 class="page-title">Available Models</h1>
-                            <p class="page-subtitle">Showing top 20 text-based models (Rank 1 = Best)</p>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-body">
-                                <div class="model-grid">
-                                    {models_html}
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- Stats Section -->
-                    <div id="section-stats" class="section">
-                        <div class="page-header">
-                            <h1 class="page-title">Usage Statistics</h1>
-                            <p class="page-subtitle">Track model usage and request patterns</p>
-                        </div>
-                        
-                        <div class="grid-2">
-                            <div class="card">
-                                <div class="card-header">
-                                    <span class="card-title">📊 Model Distribution</span>
-                                </div>
-                                <div class="card-body">
-                                    <div class="chart-container">
-                                        <canvas id="modelPieChart"></canvas>
-                                    </div>
-                                </div>
-                            </div>
-                            
-                            <div class="card">
-                                <div class="card-header">
-                                    <span class="card-title">📈 Request Count</span>
-                                </div>
-                                <div class="card-body">
-                                    <div class="chart-container">
-                                        <canvas id="modelBarChart"></canvas>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">📋 Detailed Breakdown</span>
-                            </div>
-                            <div class="card-body">
-                                <div class="table-responsive">
-                                    <table>
-                                        <thead>
-                                            <tr>
-                                                <th>Model</th>
-                                                <th>Requests</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {stats_html}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- Logs Section -->
-                    <div id="section-logs" class="section">
-                        <div class="page-header">
-                            <h1 class="page-title">Live Logs</h1>
-                            <p class="page-subtitle">Real-time server activity and debug output</p>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">📜 Console Output</span>
-                                <div style="display: flex; gap: 8px;">
-                                    <button class="btn btn-secondary" onclick="clearLogs()">
-                                        🗑️ Clear
-                                    </button>
-                                    <button class="btn btn-primary" id="autoscroll-btn" onclick="toggleAutoScroll()">
-                                        <span id="autoscroll-icon">⏬</span> Auto-scroll
-                                    </button>
-                                </div>
-                            </div>
-                            <div class="card-body" style="padding: 0;">
-                                <div id="log-container" style="
-                                    background: #0d1117;
-                                    height: 500px;
-                                    overflow-y: auto;
-                                    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-                                    font-size: 12px;
-                                    padding: 16px;
-                                    border-radius: 0 0 16px 16px;
-                                ">
-                                    <div id="log-content"></div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">🎨 Log Level Colors</span>
-                            </div>
-                            <div class="card-body">
-                                <div style="display: flex; gap: 24px; flex-wrap: wrap;">
-                                    <span><span style="color: #58a6ff;">●</span> INFO</span>
-                                    <span><span style="color: #3fb950;">●</span> SUCCESS</span>
-                                    <span><span style="color: #d29922;">●</span> WARN</span>
-                                    <span><span style="color: #f85149;">●</span> ERROR</span>
-                                    <span><span style="color: #8b949e;">●</span> DEBUG</span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- Settings Section -->
-                    <div id="section-settings" class="section">
-                        <div class="page-header">
-                            <h1 class="page-title">Settings</h1>
-                            <p class="page-subtitle">Configure system behavior and collection parameters</p>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">🔄 Token Collection Settings</span>
-                            </div>
-                            <div class="card-body">
-                                <form action="/update-collection-settings" method="post">
-                                    <div class="form-row">
-                                        <div class="form-group">
-                                            <label class="form-label">Default Tokens to Collect</label>
-                                            <input type="number" class="form-input" name="token_collect_count" 
-                                                value="{config.get('token_collect_count', 15)}" min="1" max="50">
-                                            <p class="form-hint">Number of tokens to collect per session (1-50)</p>
-                                        </div>
-                                        <div class="form-group">
-                                            <label class="form-label">Delay Between Collections (seconds)</label>
-                                            <input type="number" class="form-input" name="token_collect_delay" 
-                                                value="{config.get('token_collect_delay', 5)}" min="1" max="60">
-                                            <p class="form-hint">Wait time between each token collection (1-60s)</p>
-                                        </div>
-                                    </div>
-                                    <button type="submit" class="btn btn-primary">💾 Save Settings</button>
-                                </form>
-                            </div>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">📊 Current Configuration</span>
-                            </div>
-                            <div class="card-body">
-                                <div style="background: var(--bg); padding: 16px; border-radius: 8px; font-family: monospace; font-size: 13px;">
-                                    <div style="margin-bottom: 8px;"><span style="color: var(--text-muted);">DEBUG:</span> <span style="color: var(--primary);">{DEBUG}</span></div>
-                                    <div style="margin-bottom: 8px;"><span style="color: var(--text-muted);">PORT:</span> <span style="color: var(--primary);">{PORT}</span></div>
-                                    <div style="margin-bottom: 8px;"><span style="color: var(--text-muted);">CHUNK_SIZE:</span> <span style="color: var(--primary);">{CHUNK_SIZE:,}</span></div>
-                                    <div style="margin-bottom: 8px;"><span style="color: var(--text-muted);">CHUNK_ROTATION_LIMIT:</span> <span style="color: var(--primary);">{CHUNK_ROTATION_LIMIT}</span></div>
-                                    <div style="margin-bottom: 8px;"><span style="color: var(--text-muted);">STICKY_SESSIONS:</span> <span style="color: var(--primary);">{STICKY_SESSIONS}</span></div>
-                                    <div><span style="color: var(--text-muted);">RECAPTCHA_CACHE_TTL:</span> <span style="color: var(--primary);">{RECAPTCHA_TOKEN_CACHE_TTL}s</span></div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <span class="card-title">ℹ️ About</span>
-                            </div>
-                            <div class="card-body">
-                                <div style="text-align: center; padding: 20px;">
-                                    <div style="font-size: 48px; margin-bottom: 16px;">🚀</div>
-                                    <h2 style="margin-bottom: 8px;">LMArena Bridge</h2>
-                                    <p style="color: var(--text-muted); margin-bottom: 16px;">High-performance LMArena API proxy</p>
-                                    <p style="color: var(--text-muted); font-size: 14px;">
-                                        By: <span style="color: var(--primary);">@rumoto</span> and <span style="color: var(--primary);">@norenaboi</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </main>
-            </div>
+        html {{
+            scroll-behavior: smooth;
+        }}
+
+        body {{
+            background: var(--bg-dark);
+            background-image: 
+                radial-gradient(ellipse at 0% 0%, rgba(59, 130, 246, 0.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 100% 100%, rgba(99, 102, 241, 0.06) 0%, transparent 50%),
+                radial-gradient(ellipse at 50% 50%, rgba(14, 165, 233, 0.03) 0%, transparent 70%);
+            color: var(--text-main);
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+        }}
+
+        /* Animated Background Particles */
+        .bg-particles {{
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 0;
+            overflow: hidden;
+        }}
+
+        .particle {{
+            position: absolute;
+            width: 2px;
+            height: 2px;
+            background: var(--primary);
+            border-radius: 50%;
+            opacity: 0;
+            animation: float-particle 15s infinite;
+        }}
+
+        @keyframes float-particle {{
+            0%, 100% {{ opacity: 0; transform: translateY(100vh) scale(0); }}
+            10% {{ opacity: 0.6; }}
+            90% {{ opacity: 0.6; }}
+            100% {{ opacity: 0; transform: translateY(-100vh) scale(1); }}
+        }}
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {{
+            width: 6px;
+            height: 6px;
+        }}
+        ::-webkit-scrollbar-track {{
+            background: transparent;
+        }}
+        ::-webkit-scrollbar-thumb {{
+            background: var(--border);
+            border-radius: 10px;
+            transition: background var(--transition-normal);
+        }}
+        ::-webkit-scrollbar-thumb:hover {{
+            background: var(--primary);
+        }}
+
+        /* Glassmorphism Card Effect */
+        .glass {{
+            background: linear-gradient(135deg, rgba(10, 22, 40, 0.8) 0%, rgba(15, 29, 50, 0.6) 100%);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(59, 130, 246, 0.1);
+        }}
+
+        /* Sidebar */
+        .sidebar {{
+            width: var(--sidebar-width);
+            background: linear-gradient(180deg, var(--bg-card) 0%, var(--bg-darker) 100%);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            padding: 24px 20px;
+            transition: all var(--transition-slow) var(--ease-smooth);
+            z-index: 100;
+            position: relative;
+            overflow: hidden;
+        }}
+
+        .sidebar::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 150px;
+            background: radial-gradient(ellipse at 50% 0%, rgba(59, 130, 246, 0.1) 0%, transparent 70%);
+            pointer-events: none;
+        }}
+
+        .brand {{
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-bottom: 40px;
+            padding: 12px 16px;
+            position: relative;
+            z-index: 1;
+        }}
+
+        .brand-icon {{
+            font-size: 32px;
+            filter: drop-shadow(0 0 20px var(--primary-glow));
+            animation: pulse-glow 3s ease-in-out infinite;
+        }}
+
+        @keyframes pulse-glow {{
+            0%, 100% {{ filter: drop-shadow(0 0 15px var(--primary-glow)); transform: scale(1); }}
+            50% {{ filter: drop-shadow(0 0 25px var(--primary-glow)); transform: scale(1.05); }}
+        }}
+
+        .brand-text {{
+            font-size: 22px;
+            font-weight: 800;
+            background: linear-gradient(135deg, #ffffff 0%, var(--primary-light) 50%, var(--accent) 100%);
+            background-size: 200% 200%;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: gradient-shift 5s ease infinite;
+            letter-spacing: -0.5px;
+        }}
+
+        @keyframes gradient-shift {{
+            0%, 100% {{ background-position: 0% 50%; }}
+            50% {{ background-position: 100% 50%; }}
+        }}
+
+        .nav-menu {{
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            flex: 1;
+            position: relative;
+            z-index: 1;
+        }}
+
+        .nav-item {{
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 14px 18px;
+            border-radius: 14px;
+            color: var(--text-muted);
+            text-decoration: none;
+            transition: all var(--transition-normal) var(--ease-smooth);
+            cursor: pointer;
+            border: 1px solid transparent;
+            position: relative;
+            overflow: hidden;
+            font-weight: 500;
+        }}
+
+        .nav-item::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(59, 130, 246, 0.1), transparent);
+            transform: translateX(-100%);
+            transition: transform 0.6s ease;
+        }}
+
+        .nav-item:hover::before {{
+            transform: translateX(100%);
+        }}
+
+        .nav-item:hover {{
+            background: linear-gradient(135deg, var(--bg-hover) 0%, rgba(59, 130, 246, 0.08) 100%);
+            color: var(--text-main);
+            transform: translateX(4px);
+            border-color: rgba(59, 130, 246, 0.15);
+        }}
+
+        .nav-item.active {{
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.15) 0%, rgba(99, 102, 241, 0.1) 100%);
+            color: var(--primary-light);
+            border-color: rgba(59, 130, 246, 0.3);
+            box-shadow: 
+                0 0 20px rgba(59, 130, 246, 0.15),
+                inset 0 0 20px rgba(59, 130, 246, 0.05);
+        }}
+
+        .nav-item.active .nav-icon {{
+            transform: scale(1.1);
+            filter: drop-shadow(0 0 8px var(--primary-glow));
+        }}
+
+        .nav-icon {{
+            font-size: 20px;
+            transition: all var(--transition-normal) var(--ease-bounce);
+        }}
+
+        .nav-item:hover .nav-icon {{
+            transform: scale(1.15) rotate(-5deg);
+        }}
+
+        .user-profile {{
+            margin-top: auto;
+            padding: 16px;
+            background: linear-gradient(135deg, var(--bg-hover) 0%, rgba(59, 130, 246, 0.05) 100%);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            border: 1px solid var(--border);
+            transition: all var(--transition-normal) var(--ease-smooth);
+            position: relative;
+            z-index: 1;
+        }}
+
+        .user-profile:hover {{
+            border-color: var(--primary);
+            box-shadow: 0 0 25px rgba(59, 130, 246, 0.15);
+            transform: translateY(-2px);
+        }}
+
+        .user-avatar {{
+            width: 42px;
+            height: 42px;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 50%, var(--accent) 100%);
+            background-size: 200% 200%;
+            animation: gradient-shift 4s ease infinite;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            color: white;
+            font-size: 16px;
+            box-shadow: 0 4px 15px rgba(59, 130, 246, 0.3);
+        }}
+
+        .logout-btn {{
+            color: var(--text-muted);
+            text-decoration: none;
+            padding: 8px;
+            border-radius: 8px;
+            transition: all var(--transition-fast);
+            font-size: 18px;
+        }}
+
+        .logout-btn:hover {{
+            color: var(--error);
+            background: rgba(239, 68, 68, 0.1);
+            transform: scale(1.1);
+        }}
+
+        /* Main Content */
+        .main-content {{
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+            position: relative;
+            z-index: 1;
+        }}
+
+        .header {{
+            height: var(--header-height);
+            padding: 0 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+            background: linear-gradient(180deg, rgba(10, 22, 40, 0.95) 0%, rgba(2, 6, 23, 0.9) 100%);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            position: sticky;
+            top: 0;
+            z-index: 40;
+        }}
+
+        .page-title {{
+            font-size: 26px;
+            font-weight: 700;
+            color: var(--text-main);
+            letter-spacing: -0.5px;
+            position: relative;
+        }}
+
+        .page-title::after {{
+            content: '';
+            position: absolute;
+            bottom: -4px;
+            left: 0;
+            width: 40px;
+            height: 3px;
+            background: linear-gradient(90deg, var(--primary), transparent);
+            border-radius: 2px;
+        }}
+
+        .version-badge {{
+            padding: 6px 14px;
+            background: linear-gradient(135deg, var(--bg-hover) 0%, rgba(59, 130, 246, 0.1) 100%);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            transition: all var(--transition-normal);
+        }}
+
+        .version-badge:hover {{
+            border-color: var(--primary);
+            color: var(--primary-light);
+            transform: scale(1.05);
+        }}
+
+        .content-scroll {{
+            flex: 1;
+            overflow-y: auto;
+            padding: 32px;
+            scroll-behavior: smooth;
+            -webkit-overflow-scrolling: touch;
+        }}
+
+        .section {{
+            display: none;
+            animation: section-enter 0.5s var(--ease-smooth);
+        }}
+
+        .section.active {{
+            display: block;
+        }}
+
+        @keyframes section-enter {{
+            from {{ 
+                opacity: 0; 
+                transform: translateY(30px) scale(0.98);
+                filter: blur(4px);
+            }}
+            to {{ 
+                opacity: 1; 
+                transform: translateY(0) scale(1);
+                filter: blur(0);
+            }}
+        }}
+
+        /* Grid Layouts */
+        .grid-2 {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+            gap: 24px;
+            margin-bottom: 24px;
+        }}
+
+        .grid-4 {{
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            margin-bottom: 28px;
+        }}
+
+        /* Cards - Enhanced with Glass Effect */
+        .card {{
+            background: linear-gradient(145deg, var(--bg-card) 0%, rgba(15, 29, 50, 0.8) 100%);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 24px;
+            transition: all var(--transition-normal) var(--ease-smooth);
+            position: relative;
+            overflow: hidden;
+        }}
+
+        .card::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(59, 130, 246, 0.3), transparent);
+        }}
+
+        .card:hover {{
+            transform: translateY(-4px);
+            box-shadow: 
+                0 20px 40px -15px rgba(0, 0, 0, 0.5),
+                0 0 30px rgba(59, 130, 246, 0.1);
+            border-color: rgba(59, 130, 246, 0.3);
+        }}
+
+        /* Stat Cards - Premium Design */
+        .stat-card {{
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            position: relative;
+            overflow: hidden;
+        }}
+
+        .stat-card::after {{
+            content: '';
+            position: absolute;
+            bottom: 0;
+            right: 0;
+            width: 120px;
+            height: 120px;
+            background: radial-gradient(circle, rgba(59, 130, 246, 0.08) 0%, transparent 70%);
+            transform: translate(30%, 30%);
+            transition: all var(--transition-slow);
+        }}
+
+        .stat-card:hover::after {{
+            transform: translate(20%, 20%) scale(1.2);
+            background: radial-gradient(circle, rgba(59, 130, 246, 0.15) 0%, transparent 70%);
+        }}
+
+        .stat-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: var(--text-muted);
+            font-size: 13px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+
+        .stat-icon {{
+            font-size: 24px;
+            filter: grayscale(0.3);
+            transition: all var(--transition-normal);
+        }}
+
+        .stat-card:hover .stat-icon {{
+            filter: grayscale(0);
+            transform: scale(1.2) rotate(5deg);
+        }}
+
+        .stat-value {{
+            font-size: 36px;
+            font-weight: 800;
+            color: var(--text-main);
+            background: linear-gradient(135deg, var(--text-main) 0%, var(--primary-light) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            line-height: 1.1;
+        }}
+
+        .stat-trend {{
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            background: rgba(16, 185, 129, 0.1);
+            border-radius: 20px;
+            width: fit-content;
+            font-weight: 500;
+        }}
+
+        .trend-up {{ 
+            color: var(--success);
+            background: rgba(16, 185, 129, 0.1);
+        }}
+        .trend-down {{ 
+            color: var(--error);
+            background: rgba(239, 68, 68, 0.1);
+        }}
+
+        /* Tables - Enhanced */
+        .table-container {{
+            overflow-x: auto;
+            border-radius: 12px;
+        }}
+
+        table {{
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+        }}
+
+        th {{
+            text-align: left;
+            padding: 16px 20px;
+            color: var(--text-muted);
+            font-weight: 600;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid var(--border);
+            background: rgba(15, 29, 50, 0.5);
+        }}
+
+        td {{
+            padding: 16px 20px;
+            border-bottom: 1px solid rgba(30, 58, 95, 0.5);
+            color: var(--text-main);
+            transition: all var(--transition-fast);
+        }}
+
+        tr {{
+            transition: all var(--transition-fast);
+        }}
+
+        tbody tr:hover {{
+            background: linear-gradient(90deg, rgba(59, 130, 246, 0.05) 0%, transparent 100%);
+        }}
+
+        tbody tr:hover td {{
+            color: var(--primary-light);
+        }}
+
+        tr:last-child td {{
+            border-bottom: none;
+        }}
+
+        /* Forms - Premium Inputs */
+        .form-group {{
+            margin-bottom: 24px;
+        }}
+
+        .form-label {{
+            display: block;
+            margin-bottom: 10px;
+            color: var(--text-secondary);
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+
+        .form-input {{
+            width: 100%;
+            padding: 14px 18px;
+            background: linear-gradient(135deg, var(--bg-dark) 0%, rgba(15, 29, 50, 0.5) 100%);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-main);
+            font-size: 14px;
+            transition: all var(--transition-normal) var(--ease-smooth);
+        }}
+
+        .form-input:focus {{
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 
+                0 0 0 3px rgba(59, 130, 246, 0.15),
+                0 0 20px rgba(59, 130, 246, 0.1);
+            transform: translateY(-1px);
+        }}
+
+        .form-input::placeholder {{
+            color: var(--text-muted);
+        }}
+
+        textarea.form-input {{
+            resize: vertical;
+            min-height: 120px;
+            font-family: 'SF Mono', 'Fira Code', 'Monaco', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+        }}
+
+        /* Select/Dropdown Styling */
+        select.form-input {{
+            appearance: none;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2360a5fa' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 14px center;
+            padding-right: 40px;
+            cursor: pointer;
+        }}
+
+        select.form-input option {{
+            background: var(--bg-card);
+            color: var(--text-main);
+            padding: 12px;
+        }}
+
+        select.form-input option:hover,
+        select.form-input option:focus,
+        select.form-input option:checked {{
+            background: var(--primary);
+            color: white;
+        }}
+
+        /* Buttons - Premium Design with Touch Support */
+        .btn {{
+            padding: 14px 28px;
+            border-radius: 12px;
+            border: none;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all var(--transition-normal) var(--ease-smooth);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            position: relative;
+            overflow: hidden;
+            text-decoration: none;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+        }}
+
+        .btn::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s ease;
+        }}
+
+        .btn:hover::before {{
+            left: 100%;
+        }}
+
+        .btn-primary {{
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: white;
+            box-shadow: 
+                0 4px 15px rgba(59, 130, 246, 0.3),
+                inset 0 1px 0 rgba(255,255,255,0.1);
+        }}
+
+        .btn-primary:hover {{
+            transform: translateY(-2px) scale(1.02);
+            box-shadow: 
+                0 8px 25px rgba(59, 130, 246, 0.4),
+                0 0 30px rgba(59, 130, 246, 0.2);
+        }}
+
+        .btn-primary:active {{
+            transform: translateY(0) scale(0.98);
+        }}
+
+        .btn-danger {{
+            background: linear-gradient(135deg, var(--error) 0%, #dc2626 100%);
+            color: white;
+            padding: 10px 18px;
+            font-size: 13px;
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.25);
+        }}
+
+        .btn-danger:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(239, 68, 68, 0.35);
+        }}
+
+        .btn-secondary {{
+            background: linear-gradient(135deg, var(--bg-hover) 0%, var(--bg-card) 100%);
+            color: var(--text-main);
+            border: 1px solid var(--border);
+        }}
+
+        .btn-secondary:hover {{
+            border-color: var(--primary);
+            color: var(--primary-light);
+            transform: translateY(-2px);
+        }}
+
+        /* Badges */
+        .badge {{
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 12px;
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.15) 0%, rgba(99, 102, 241, 0.1) 100%);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--primary-light);
+            transition: all var(--transition-fast);
+        }}
+
+        .badge:hover {{
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.25) 0%, rgba(99, 102, 241, 0.15) 100%);
+            transform: scale(1.05);
+        }}
+
+        /* API Key Code Display */
+        .api-key-code {{
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 12px;
+            padding: 8px 14px;
+            background: linear-gradient(135deg, var(--bg-dark) 0%, rgba(15, 29, 50, 0.8) 100%);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--accent);
+            word-break: break-all;
+            display: inline-block;
+            transition: all var(--transition-fast);
+        }}
+
+        .api-key-code:hover {{
+            border-color: var(--accent);
+            box-shadow: 0 0 15px rgba(14, 165, 233, 0.2);
+        }}
+
+        /* Section Headers */
+        .section-header {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }}
+
+        .section-header h3 {{
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+
+        .section-header h3::before {{
+            content: '';
+            width: 4px;
+            height: 20px;
+            background: linear-gradient(180deg, var(--primary), var(--accent));
+            border-radius: 2px;
+        }}
+
+        /* Progress Bars */
+        .progress-container {{
+            margin: 20px 0;
+        }}
+
+        .progress-header {{
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            font-size: 13px;
+            color: var(--text-muted);
+            font-weight: 500;
+        }}
+
+        .progress-bar-bg {{
+            height: 8px;
+            background: var(--bg-dark);
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.3);
+        }}
+
+        .progress-bar-fill {{
+            height: 100%;
+            background: linear-gradient(90deg, var(--primary), var(--accent));
+            border-radius: 10px;
+            transition: width 0.5s var(--ease-smooth);
+            position: relative;
+        }}
+
+        .progress-bar-fill::after {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+            animation: shimmer 2s infinite;
+        }}
+
+        @keyframes shimmer {{
+            0% {{ transform: translateX(-100%); }}
+            100% {{ transform: translateX(100%); }}
+        }}
+
+        /* Collection Badge */
+        .collection-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 20px;
+            border-radius: 30px;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all var(--transition-normal);
+        }}
+
+        .collection-badge.idle {{
+            background: var(--bg-dark);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }}
+
+        .collection-badge.running {{
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(14, 165, 233, 0.2));
+            color: var(--primary-light);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            animation: pulse-badge 2s ease-in-out infinite;
+        }}
+
+        .collection-badge.done {{
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(52, 211, 153, 0.15));
+            color: var(--success);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }}
+
+        @keyframes pulse-badge {{
+            0%, 100% {{ box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4); }}
+            50% {{ box-shadow: 0 0 0 10px rgba(59, 130, 246, 0); }}
+        }}
+
+        /* Logs Container */
+        .logs-container {{
+            background: linear-gradient(180deg, #000408 0%, #010610 100%);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 20px;
+            font-family: 'SF Mono', 'Fira Code', 'Monaco', monospace;
+            font-size: 12px;
+            line-height: 1.8;
+            overflow-y: auto;
+            scroll-behavior: smooth;
+        }}
+
+        .log-entry {{
+            padding: 4px 0;
+            border-left: 2px solid transparent;
+            padding-left: 12px;
+            margin-left: -12px;
+            transition: all var(--transition-fast);
+        }}
+
+        .log-entry:hover {{
+            background: rgba(59, 130, 246, 0.05);
+            border-left-color: var(--primary);
+        }}
+
+        .log-timestamp {{
+            color: var(--text-muted);
+        }}
+
+        .log-level {{
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            text-transform: uppercase;
+        }}
+
+        .log-level-info {{ color: var(--primary); background: rgba(59, 130, 246, 0.1); }}
+        .log-level-success {{ color: var(--success); background: rgba(16, 185, 129, 0.1); }}
+        .log-level-warn {{ color: var(--warning); background: rgba(245, 158, 11, 0.1); }}
+        .log-level-error {{ color: var(--error); background: rgba(239, 68, 68, 0.1); }}
+        .log-level-debug {{ color: var(--text-muted); background: rgba(100, 116, 139, 0.1); }}
+
+        .log-message {{
+            color: var(--text-secondary);
+        }}
+
+        /* System Info Panel */
+        .system-info {{
+            background: linear-gradient(135deg, var(--bg-dark) 0%, rgba(10, 22, 40, 0.8) 100%);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 20px;
+        }}
+
+        .system-info-row {{
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(30, 58, 95, 0.3);
+        }}
+
+        .system-info-row:last-child {{
+            border-bottom: none;
+        }}
+
+        .system-info-label {{
+            color: var(--text-muted);
+            font-size: 13px;
+            font-weight: 500;
+        }}
+
+        .system-info-value {{
+            color: var(--primary-light);
+            font-family: 'SF Mono', monospace;
+            font-size: 13px;
+            font-weight: 600;
+        }}
+
+        /* No Data State */
+        .no-data {{
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-muted);
+            font-size: 14px;
+        }}
+
+        .no-data-icon {{
+            font-size: 48px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }}
+
+        /* Mobile Toggle */
+        .mobile-toggle {{
+            display: none;
+            font-size: 24px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-main);
+            cursor: pointer;
+            padding: 12px 16px;
+            transition: all var(--transition-fast);
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            user-select: none;
+        }}
+
+        .mobile-toggle:hover, .mobile-toggle:active {{
+            background: var(--bg-hover);
+            border-color: var(--primary);
+            color: var(--primary-light);
+        }}
+
+        /* Overlay for mobile sidebar */
+        .sidebar-overlay {{
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            z-index: 90;
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
+            transition: opacity var(--transition-normal), visibility var(--transition-normal);
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+        }}
+
+        .sidebar-overlay.active {{
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
+        }}
+
+        /* Modal Overlay */
+        .modal-overlay {{
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(8px);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            animation: fadeIn 0.2s ease;
+        }}
+
+        .modal-content {{
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            width: 100%;
+            max-width: 500px;
+            max-height: 90vh;
+            overflow-y: auto;
+            animation: slideUp 0.3s ease;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }}
+
+        .modal-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 20px 24px;
+            border-bottom: 1px solid var(--border);
+        }}
+
+        .modal-header h3 {{
+            margin: 0;
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-main);
+        }}
+
+        .modal-close {{
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            font-size: 28px;
+            cursor: pointer;
+            padding: 0;
+            line-height: 1;
+            transition: all 0.2s ease;
+        }}
+
+        .modal-close:hover {{
+            color: var(--danger);
+            transform: scale(1.1);
+        }}
+
+        .modal-content form {{
+            padding: 24px;
+        }}
+
+        @keyframes slideUp {{
+            from {{
+                opacity: 0;
+                transform: translateY(20px);
+            }}
+            to {{
+                opacity: 1;
+                transform: translateY(0);
+            }}
+        }}
+
+        /* Token List Styles */
+        .token-list {{
+            scrollbar-width: thin;
+            scrollbar-color: var(--border) transparent;
+        }}
+
+        .token-list::-webkit-scrollbar {{
+            width: 6px;
+        }}
+
+        .token-list::-webkit-scrollbar-track {{
+            background: transparent;
+        }}
+
+        .token-list::-webkit-scrollbar-thumb {{
+            background: var(--border);
+            border-radius: 3px;
+        }}
+
+        .token-list::-webkit-scrollbar-thumb:hover {{
+            background: var(--border-light);
+        }}
+
+        .token-item:hover {{
+            border-color: var(--primary);
+            background: var(--bg-hover);
+        }}
+
+        /* Avatar Option Buttons */
+        .avatar-option {{
+            width: 44px;
+            height: 44px;
+            font-size: 22px;
+            background: var(--bg-dark);
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+
+        .avatar-option:hover {{
+            border-color: var(--primary);
+            background: var(--bg-hover);
+            transform: scale(1.1);
+        }}
+
+        .avatar-option:active {{
+            transform: scale(0.95);
+        }}
+
+        /* Ripple Effect */
+        .ripple {{
+            position: absolute;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.3);
+            transform: scale(0);
+            animation: ripple-effect 0.6s ease-out;
+            pointer-events: none;
+        }}
+
+        @keyframes ripple-effect {{
+            to {{
+                transform: scale(4);
+                opacity: 0;
+            }}
+        }}
+
+        /* Tooltip */
+        .tooltip {{
+            position: relative;
+        }}
+
+        .tooltip::after {{
+            content: attr(data-tooltip);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%) translateY(-8px);
+            padding: 8px 14px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 12px;
+            color: var(--text-main);
+            white-space: nowrap;
+            opacity: 0;
+            visibility: hidden;
+            transition: all var(--transition-fast);
+            z-index: 100;
+        }}
+
+        .tooltip:hover::after {{
+            opacity: 1;
+            visibility: visible;
+            transform: translateX(-50%) translateY(-12px);
+        }}
+
+        /* Chart Container */
+        .chart-container {{
+            position: relative;
+            height: 300px;
+            padding: 10px;
+        }}
+
+        /* Responsive Design */
+        @media (max-width: 1200px) {{
+            .grid-4 {{
+                grid-template-columns: repeat(2, 1fr);
+            }}
+        }}
+
+        @media (max-width: 992px) {{
+            .grid-2 {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+
+        @media (max-width: 768px) {{
+            /* Disable hover effects on touch devices */
+            * {{
+                -webkit-tap-highlight-color: transparent;
+            }}
             
-            <script>
-                // Section navigation
-                function showSection(name) {{
-                    // Hide all sections
-                    document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-                    // Show selected section
-                    document.getElementById('section-' + name).classList.add('active');
-                    // Update nav
-                    document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
-                    event.target.closest('.nav-link').classList.add('active');
-                }}
+            .sidebar {{
+                position: fixed;
+                left: -100%;
+                width: 85%;
+                max-width: 300px;
+                height: 100%;
+                box-shadow: 20px 0 60px rgba(0,0,0,0.6);
+                transition: left var(--transition-normal) var(--ease-smooth);
+                z-index: 100;
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+            }}
+            
+            .sidebar.open {{
+                left: 0;
+            }}
+
+            .sidebar-overlay {{
+                display: block;
+                pointer-events: none;
+            }}
+            
+            .sidebar-overlay.active {{
+                pointer-events: auto;
+            }}
+
+            .mobile-toggle {{
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+
+            .header {{
+                padding: 0 16px;
+            }}
+
+            .page-title {{
+                font-size: 20px;
+            }}
+
+            .content-scroll {{
+                padding: 16px;
+                padding-bottom: 100px; /* Extra space for bottom elements */
+            }}
+
+            .grid-4 {{
+                grid-template-columns: 1fr;
+                gap: 16px;
+            }}
+
+            .grid-2 {{
+                grid-template-columns: 1fr;
+            }}
+
+            .card {{
+                padding: 20px;
+            }}
+
+            .stat-value {{
+                font-size: 28px;
+            }}
+
+            /* Mobile-friendly buttons */
+            .btn {{
+                padding: 14px 20px;
+                min-height: 48px; /* Touch-friendly minimum */
+                width: 100%;
+                justify-content: center;
+                touch-action: manipulation;
+                user-select: none;
+            }}
+            
+            /* Navigation items need bigger touch targets */
+            .nav-item {{
+                padding: 18px 20px;
+                min-height: 56px;
+                touch-action: manipulation;
+            }}
+
+            table {{
+                font-size: 13px;
+            }}
+
+            th, td {{
+                padding: 12px 10px;
+            }}
+
+            .chart-container {{
+                height: 250px;
+            }}
+            
+            /* Fix z-index stacking */
+            .modal-overlay {{
+                z-index: 200;
+            }}
+            
+            .modal-content {{
+                z-index: 201;
+            }}
+        }}
+
+        @media (max-width: 480px) {{
+            .grid-4 {{
+                gap: 12px;
+            }}
+
+            .card {{
+                padding: 16px;
+                border-radius: 16px;
+            }}
+
+            .section-header {{
+                flex-direction: column;
+                align-items: flex-start !important;
+                gap: 12px;
+            }}
+
+            .section-header h3 {{
+                font-size: 16px;
+            }}
+
+            .section-header > div {{
+                width: 100%;
+                flex-direction: column;
+                gap: 10px;
+            }}
+
+            .section-header select, .section-header button {{
+                width: 100% !important;
+                min-width: unset !important;
+                min-height: 48px;
+            }}
+
+            .stat-card {{
+                padding: 16px;
+            }}
+
+            .stat-value {{
+                font-size: 24px;
+            }}
+
+            .api-key-code {{
+                font-size: 10px;
+                padding: 6px 10px;
+                word-break: break-all;
+            }}
+
+            .badge {{
+                font-size: 10px;
+                padding: 4px 8px;
+            }}
+
+            /* Mobile table improvements */
+            .table-container {{
+                margin: 0 -16px;
+                padding: 0 16px;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+            }}
+
+            table {{
+                min-width: 500px;
+            }}
+
+            th, td {{
+                padding: 10px 8px;
+                font-size: 12px;
+            }}
+
+            /* Mobile form improvements */
+            .form-group {{
+                margin-bottom: 16px;
+            }}
+
+            .form-input, input, select, textarea {{
+                padding: 14px 16px;
+                font-size: 16px !important; /* Prevents iOS zoom on focus */
+                min-height: 48px;
+                touch-action: manipulation;
+            }}
+            
+            /* Fix select dropdowns on mobile */
+            select {{
+                -webkit-appearance: none;
+                appearance: none;
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2394a3b8' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10l-5 5z'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: right 12px center;
+                padding-right: 36px;
+            }}
+
+            /* Mobile nav improvements */
+            .nav-item {{
+                padding: 18px 20px;
+                min-height: 56px;
+                display: flex;
+                align-items: center;
+            }}
+
+            .nav-icon {{
+                font-size: 22px;
+            }}
+
+            /* Mobile user profile */
+            .user-profile {{
+                padding: 16px;
+            }}
+
+            /* Modal mobile fixes */
+            .modal-overlay {{
+                padding: 12px;
+                align-items: flex-start;
+                padding-top: 60px;
+            }}
+            
+            .modal-content {{
+                margin: 0;
+                max-height: calc(100vh - 80px);
+                width: 100%;
+                border-radius: 16px;
+            }}
+            
+            .modal-header {{
+                padding: 16px 20px;
+                position: sticky;
+                top: 0;
+                background: var(--bg-card);
+                z-index: 10;
+            }}
+            
+            .modal-body {{
+                padding: 16px 20px;
+            }}
+            
+            .modal-close {{
+                min-width: 44px;
+                min-height: 44px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+
+            /* Chart smaller on mobile */
+            .chart-container {{
+                height: 200px;
+            }}
+
+            /* Leaderboard table mobile fix */
+            #leaderboard-table {{
+                min-width: 650px;
+            }}
+
+            /* Token list mobile */
+            .token-item {{
+                flex-direction: column;
+                gap: 12px;
+                align-items: stretch !important;
+                padding: 16px;
+            }}
+
+            .token-item > div:first-child {{
+                flex-direction: column;
+                gap: 8px;
+            }}
+
+            .token-item form {{
+                margin-left: 0 !important;
+                align-self: stretch;
+            }}
+            
+            .token-item form button {{
+                width: 100%;
+            }}
+            
+            /* Mobile-friendly action buttons */
+            .btn-danger, .btn-primary, .btn-secondary {{
+                min-height: 48px;
+                padding: 12px 16px;
+            }}
+            
+            /* Fix clickable areas */
+            a, button, [onclick], .clickable {{
+                min-height: 44px;
+                min-width: 44px;
+            }}
+            
+            /* Better touch feedback */
+            button:active, .btn:active, .nav-item:active {{
+                transform: scale(0.98);
+                opacity: 0.9;
+            }}
+        }}
+
+        /* Extra small mobile */
+        @media (max-width: 360px) {{
+            .brand-text {{
+                font-size: 16px;
+            }}
+
+            .stat-value {{
+                font-size: 18px;
+            }}
+
+            .page-title {{
+                font-size: 16px;
+            }}
+            
+            .card {{
+                padding: 14px;
+            }}
+            
+            .section-header h3 {{
+                font-size: 14px;
+            }}
+            
+            .btn {{
+                padding: 12px 16px;
+                font-size: 13px;
+            }}
+            
+            .nav-item {{
+                padding: 14px 16px;
+            }}
+        }}
+        
+        /* Touch device optimizations */
+        @media (hover: none) and (pointer: coarse) {{
+            /* Remove hover effects on touch devices */
+            .btn:hover {{
+                transform: none;
+            }}
+            
+            .btn:active {{
+                transform: scale(0.97);
+            }}
+            
+            .nav-item:hover {{
+                background: transparent;
+            }}
+            
+            .nav-item:active {{
+                background: var(--bg-hover);
+            }}
+            
+            /* Larger touch targets */
+            .btn, button, a, .nav-item, select, input {{
+                min-height: 44px;
+            }}
+            
+            /* Disable animations that can cause jank */
+            .card {{
+                transition: none;
+            }}
+            
+            tbody tr:hover {{
+                transform: none;
+            }}
+        }}
+
+        /* Loading Animation */
+        .loading-dots {{
+            display: inline-flex;
+            gap: 4px;
+        }}
+
+        .loading-dots span {{
+            width: 6px;
+            height: 6px;
+            background: var(--primary);
+            border-radius: 50%;
+            animation: bounce-dot 1.4s ease-in-out infinite;
+        }}
+
+        .loading-dots span:nth-child(1) {{ animation-delay: 0s; }}
+        .loading-dots span:nth-child(2) {{ animation-delay: 0.2s; }}
+        .loading-dots span:nth-child(3) {{ animation-delay: 0.4s; }}
+
+        @keyframes bounce-dot {{
+            0%, 80%, 100% {{ transform: scale(0.6); opacity: 0.5; }}
+            40% {{ transform: scale(1); opacity: 1; }}
+        }}
+
+        /* Skeleton Loading */
+        .skeleton {{
+            background: linear-gradient(90deg, var(--bg-hover) 25%, var(--bg-card) 50%, var(--bg-hover) 75%);
+            background-size: 200% 100%;
+            animation: skeleton-loading 1.5s infinite;
+            border-radius: 8px;
+        }}
+
+        @keyframes skeleton-loading {{
+            0% {{ background-position: 200% 0; }}
+            100% {{ background-position: -200% 0; }}
+        }}
+
+        /* Fade In Animation for leaderboard rows */
+        @keyframes fadeIn {{
+            from {{ opacity: 0; transform: translateX(-10px); }}
+            to {{ opacity: 1; transform: translateX(0); }}
+        }}
+
+        /* Leaderboard specific styles */
+        #leaderboard-table tbody tr:hover {{
+            background: var(--bg-hover);
+        }}
+
+        #leaderboard-table tbody tr {{
+            transition: background 0.2s ease;
+        }}
+
+        /* Focus Visible for Accessibility */
+        *:focus-visible {{
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }}
+
+        /* Selection Color */
+        ::selection {{
+            background: rgba(59, 130, 246, 0.3);
+            color: var(--text-main);
+        }}
+    </style>
+</head>
+<body>
+    <!-- Animated Background Particles -->
+    <div class="bg-particles" id="particles"></div>
+    
+    <!-- Mobile Sidebar Overlay -->
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeSidebar()"></div>
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+        <div class="brand">
+            <span class="brand-icon">🚀</span>
+            <span class="brand-text">LMArena Bridge</span>
+        </div>
+        
+        <nav class="nav-menu">
+            <div class="nav-item active" onclick="showSection('dashboard')" data-section="dashboard">
+                <span class="nav-icon">📊</span>
+                <span>Dashboard</span>
+            </div>
+            <div class="nav-item" onclick="showSection('models')" data-section="models">
+                <span class="nav-icon">🤖</span>
+                <span>Models</span>
+            </div>
+            <div class="nav-item" onclick="showSection('leaderboard')" data-section="leaderboard">
+                <span class="nav-icon">🏆</span>
+                <span>Leaderboard</span>
+            </div>
+            <div class="nav-item" onclick="showSection('keys')" data-section="keys">
+                <span class="nav-icon">🔑</span>
+                <span>API Keys</span>
+            </div>
+            <div class="nav-item" onclick="showSection('auth')" data-section="auth">
+                <span class="nav-icon">🛡️</span>
+                <span>Auth Tokens</span>
+            </div>
+            <div class="nav-item" onclick="showSection('logs')" data-section="logs">
+                <span class="nav-icon">📜</span>
+                <span>Live Logs</span>
+            </div>
+            <div class="nav-item" onclick="showSection('settings')" data-section="settings">
+                <span class="nav-icon">⚙️</span>
+                <span>Settings</span>
+            </div>
+            <div class="nav-item" onclick="showSection('profile')" data-section="profile">
+                <span class="nav-icon">👤</span>
+                <span>Profile</span>
+            </div>
+        </nav>
+
+        <div class="user-profile" onclick="showSection('profile')" style="cursor: pointer;">
+            <div class="user-avatar">{config.get('profile_avatar', '👤')}</div>
+            <div style="flex: 1; overflow: hidden;">
+                <div style="font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-main);">{config.get('profile_name', 'Admin User')}</div>
+                <div style="font-size: 12px; color: var(--success); display: flex; align-items: center; gap: 6px;">
+                    <span style="width: 6px; height: 6px; background: var(--success); border-radius: 50%; animation: pulse-glow 2s infinite;"></span>
+                    Online
+                </div>
+            </div>
+            <a href="/logout" class="logout-btn tooltip" data-tooltip="Sign Out" onclick="event.stopPropagation();">🚪</a>
+        </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <header class="header">
+            <div style="display: flex; align-items: center; gap: 16px;">
+                <button class="mobile-toggle" onclick="toggleSidebar()">☰</button>
+                <h1 class="page-title" id="page-title">Dashboard</h1>
+            </div>
+            <div style="display: flex; gap: 12px; align-items: center;">
+                <span class="version-badge">v4.0.0</span>
+            </div>
+        </header>
+
+        <div class="content-scroll">
+            <!-- Dashboard Section -->
+            <div id="section-dashboard" class="section active">
+                <div class="grid-4">
+                    <div class="card stat-card" style="animation-delay: 0s;">
+                        <div class="stat-header">
+                            <span>Total Requests</span>
+                            <span class="stat-icon">📈</span>
+                        </div>
+                        <div class="stat-value">{total_requests:,}</div>
+                        <div class="stat-trend trend-up">
+                            <span>✨ All time</span>
+                        </div>
+                    </div>
+                    <div class="card stat-card" style="animation-delay: 0.1s;">
+                        <div class="stat-header">
+                            <span>Total Tokens</span>
+                            <span class="stat-icon">🔢</span>
+                        </div>
+                        <div class="stat-value">{total_tokens_str}</div>
+                        <div class="stat-trend">
+                            <span>💬 Generated</span>
+                        </div>
+                    </div>
+                    <div class="card stat-card" style="animation-delay: 0.2s;">
+                        <div class="stat-header">
+                            <span>Active Models</span>
+                            <span class="stat-icon">🤖</span>
+                        </div>
+                        <div class="stat-value">{len(model_usage_stats)}</div>
+                        <div class="stat-trend">
+                            <span>🟢 In Use</span>
+                        </div>
+                    </div>
+                    <div class="card stat-card" style="animation-delay: 0.3s;">
+                        <div class="stat-header">
+                            <span>Uptime</span>
+                            <span class="stat-icon">⏱️</span>
+                        </div>
+                        <div class="stat-value" id="uptime-value">{uptime_str}</div>
+                        <div class="stat-trend trend-up">
+                            <span>🚀 Running</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="grid-2">
+                    <div class="card">
+                        <div class="section-header">
+                            <h3>📊 Model Distribution</h3>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="modelPieChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="card" onclick="showSection('leaderboard'); loadLeaderboard();" style="cursor: pointer; transition: all 0.3s ease;" onmouseover="this.style.borderColor='var(--primary)'; this.style.transform='translateY(-4px)';" onmouseout="this.style.borderColor='var(--border)'; this.style.transform='translateY(0)';">
+                        <div class="section-header" style="justify-content: space-between;">
+                            <h3>🏆 LMArena Top Models</h3>
+                            <span style="font-size: 13px; color: var(--primary-light); display: flex; align-items: center; gap: 6px;">View Full Rankings <span style="font-size: 16px;">→</span></span>
+                        </div>
+                        <div style="padding: 8px 0;" id="top-models-preview">
+                            <div style="display: flex; flex-direction: column; gap: 8px;" id="top-models-list">
+                                <!-- Dynamically populated -->
+                            </div>
+                        </div>
+                        <div style="text-align: center; padding-top: 12px; border-top: 1px solid var(--border); margin-top: 8px;">
+                            <span style="font-size: 12px; color: var(--text-muted);">Click to see full LMArena rankings →</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="section-header">
+                        <h3>⚡ Recent Activity</h3>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Model</th>
+                                    <th>Tokens</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {recent_activity_html}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Models Section -->
+            <div id="section-models" class="section">
+                <div class="card">
+                    <div class="section-header">
+                        <h3>🤖 Model Usage Statistics</h3>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Model</th>
+                                    <th>Requests</th>
+                                    <th>Tokens</th>
+                                    <th>Last Used</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {stats_html}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Leaderboard Section -->
+            <div id="section-leaderboard" class="section">
+                <div class="card">
+                    <div class="section-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
+                        <h3>🏆 LMArena Text Leaderboard</h3>
+                        <div style="display: flex; gap: 12px; align-items: center;">
+                            <span id="leaderboard-updated" style="font-size: 12px; color: var(--text-muted);"></span>
+                            <button class="btn btn-secondary" onclick="refreshLeaderboard()" style="padding: 10px 16px;">
+                                🔄 Refresh
+                            </button>
+                        </div>
+                    </div>
+                    <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+                        📊 Rankings fetched using browser automation (bypasses Cloudflare). Click Refresh to fetch live data from <a href="https://lmarena.ai/leaderboard/text" target="_blank" style="color: var(--primary-light);">lmarena.ai</a>
+                    </p>
+                    <div id="leaderboard-loading" style="display: none; text-align: center; padding: 60px 20px;">
+                        <div class="loading-dots"><span></span><span></span><span></span></div>
+                        <p style="margin-top: 16px; color: var(--text-muted);">Loading leaderboard data...</p>
+                    </div>
+                    <div id="leaderboard-error" style="display: none; text-align: center; padding: 60px 20px; color: var(--error);">
+                        <div style="font-size: 48px; margin-bottom: 16px;">⚠️</div>
+                        <p>Failed to load leaderboard data</p>
+                        <button class="btn btn-primary" onclick="loadLeaderboard()" style="margin-top: 16px;">Try Again</button>
+                    </div>
+                    <div class="table-container" id="leaderboard-table-container" style="overflow-x: auto;">
+                        <table id="leaderboard-table" style="min-width: 700px;">
+                            <thead>
+                                <tr>
+                                    <th style="width: 60px; text-align: center;">Rank</th>
+                                    <th style="width: 120px;">Provider</th>
+                                    <th>Model</th>
+                                    <th style="width: 80px; text-align: center;">ELO</th>
+                                    <th style="width: 70px; text-align: center;">95% CI</th>
+                                    <th style="width: 80px; text-align: center;">Votes</th>
+                                </tr>
+                            </thead>
+                            <tbody id="leaderboard-body">
+                                <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 40px;">Click Refresh to fetch live rankings from LMArena</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div style="margin-top: 20px; padding: 16px; background: var(--bg-dark); border-radius: 12px; font-size: 13px; color: var(--text-muted);">
+                        <strong>📊 Data Source:</strong> <a href="https://lmarena.ai/leaderboard/text" target="_blank" style="color: var(--primary-light);">lmarena.ai/leaderboard/text</a>
+                        <span style="margin-left: 16px;">• Rankings based on human preference votes</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Keys Section -->
+            <div id="section-keys" class="section">
+                <div class="card">
+                    <div class="section-header">
+                        <h3>🔑 API Key Management</h3>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Key</th>
+                                    <th>RPM</th>
+                                    <th>RPD</th>
+                                    <th>Created</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {keys_html}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div style="margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--border);">
+                        <form action="/add-key" method="post" style="display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;">
+                            <div class="form-group" style="flex: 1; min-width: 250px; margin-bottom: 0;">
+                                <label class="form-label">New API Key</label>
+                                <input type="text" name="key" class="form-input" placeholder="sk-..." required>
+                            </div>
+                            <button type="submit" class="btn btn-primary" style="height: fit-content;">
+                                <span>➕</span> Add Key
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Auth Tokens Section -->
+            <div id="section-auth" class="section">
+                <div class="grid-2">
+                    <div class="card">
+                        <div class="section-header">
+                            <h3>🔄 Token Collection</h3>
+                        </div>
+                        <div style="text-align: center; padding: 20px;">
+                            <div id="collection-badge" class="collection-badge idle">
+                                <span class="badge-dot"></span>
+                                <span id="badge-text">Idle</span>
+                            </div>
+                            
+                            <div class="progress-container">
+                                <div class="progress-header">
+                                    <span>Progress</span>
+                                    <span id="progress-text">0 / 0</span>
+                                </div>
+                                <div class="progress-bar-bg">
+                                    <div id="progress-bar" class="progress-bar-fill" style="width: 0%;"></div>
+                                </div>
+                            </div>
+
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; text-align: left;">
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label class="form-label">Count</label>
+                                    <input type="number" id="collect-count" class="form-input" value="{config.get('token_collect_count', 15)}">
+                                </div>
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label class="form-label">Delay (s)</label>
+                                    <input type="number" id="collect-delay" class="form-input" value="{config.get('token_collect_delay', 5)}">
+                                </div>
+                            </div>
+
+                            <div style="display: flex; gap: 12px; justify-content: center; margin-top: 24px;">
+                                <button id="start-collection-btn" class="btn btn-primary" onclick="startCollection()">
+                                    <span>▶</span> Start Collection
+                                </button>
+                                <button id="stop-collection-btn" class="btn btn-danger" style="display: none;" onclick="stopCollection()">
+                                    <span>⏹</span> Stop
+                                </button>
+                            </div>
+                            <div style="margin-top: 20px; font-size: 13px; color: var(--text-muted); padding: 12px; background: var(--bg-dark); border-radius: 10px;" id="collection-status">
+                                ✨ Ready to start collection
+                            </div>
+                            
+                            <!-- Refresh Cloudflare Section -->
+                            <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
+                                <div style="text-align: center;">
+                                    <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
+                                        🔄 Refresh Cloudflare session to update cookies & models
+                                    </p>
+                                    <button id="refresh-cf-btn" class="btn btn-secondary" onclick="refreshCloudflare()" style="width: 100%;">
+                                        <span>☁️</span> Refresh Cloudflare
+                                    </button>
+                                    <div id="cf-refresh-status" style="margin-top: 12px; font-size: 12px; color: var(--text-muted); display: none;"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="section-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+                            <h3>📝 Auth Tokens ({len(config.get('auth_tokens', []))})</h3>
+                            <div style="display: flex; gap: 8px;">
+                                <button class="btn btn-secondary" style="padding: 8px 12px; font-size: 13px;" onclick="document.getElementById('add-token-modal').style.display='flex'">
+                                    <span>➕</span> Add Token
+                                </button>
+                                <form action="/delete-all-tokens" method="post" style="margin: 0;" onsubmit="return confirm('Are you sure you want to delete ALL tokens? This cannot be undone.');">
+                                    <button type="submit" class="btn btn-danger" style="padding: 8px 12px; font-size: 13px;">
+                                        <span>🗑️</span> Delete All
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                        <div class="token-list" style="max-height: 340px; overflow-y: auto; padding-right: 8px;">
+                            {tokens_html}
+                        </div>
+                    </div>
+                </div>
                 
-                // Reset defaults
-                function resetDefaults() {{
-                    document.getElementById('temperature').value = 0.7;
-                    document.getElementById('temp-value').textContent = '0.7';
-                    document.getElementById('top_p').value = 1.0;
-                    document.getElementById('topp-value').textContent = '1.0';
-                    document.getElementById('max_tokens').value = 64000;
-                    // Show feedback
-                    const btn = event.target;
-                    const originalText = btn.textContent;
-                    btn.textContent = '✓ Reset!';
-                    btn.style.background = 'var(--success)';
-                    setTimeout(() => {{
-                        btn.textContent = originalText;
-                        btn.style.background = 'var(--bg)';
-                    }}, 1500);
-                }}
-                
-                // Charts
-                const statsData = {json.dumps(dict(sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]))};
-                const modelNames = Object.keys(statsData);
-                const modelCounts = Object.values(statsData);
-                
-                const colors = [
-                    '#6366f1', '#8b5cf6', '#a855f7', '#d946ef',
-                    '#ec4899', '#f43f5e', '#f97316', '#eab308',
-                    '#84cc16', '#10b981'
-                ];
-                
-                if (modelNames.length > 0) {{
-                    // Pie Chart
-                    new Chart(document.getElementById('modelPieChart'), {{
-                        type: 'doughnut',
-                        data: {{
-                            labels: modelNames,
-                            datasets: [{{
-                                data: modelCounts,
-                                backgroundColor: colors,
-                                borderWidth: 0
-                            }}]
-                        }},
-                        options: {{
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            plugins: {{
-                                legend: {{
-                                    position: 'bottom',
-                                    labels: {{ color: '#94a3b8', padding: 12, font: {{ size: 11 }} }}
-                                }}
+                <!-- Add Token Modal -->
+                <div id="add-token-modal" class="modal-overlay" style="display: none;">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3>➕ Add Auth Tokens</h3>
+                            <button class="modal-close" onclick="document.getElementById('add-token-modal').style.display='none'">&times;</button>
+                        </div>
+                        <form action="/update-auth-tokens" method="post">
+                            <div class="form-group">
+                                <label class="form-label">Paste tokens below (one per line)</label>
+                                <textarea name="auth_tokens" class="form-input" style="height: 200px;" placeholder="Paste new tokens here...
+They will be added to existing tokens.">{auth_tokens_str}</textarea>
+                            </div>
+                            <div style="display: flex; gap: 12px; justify-content: flex-end;">
+                                <button type="button" class="btn btn-secondary" onclick="document.getElementById('add-token-modal').style.display='none'">Cancel</button>
+                                <button type="submit" class="btn btn-primary">
+                                    <span>💾</span> Save Tokens
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Logs Section -->
+            <div id="section-logs" class="section">
+                <div class="card" style="height: calc(100vh - 160px); display: flex; flex-direction: column;">
+                    <div class="section-header" style="margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+                        <h3>📜 Live System Logs</h3>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="btn btn-secondary" style="padding: 10px 14px;" onclick="toggleAutoScroll()" data-tooltip="Toggle Auto-scroll">
+                                <span id="autoscroll-icon">⏬</span>
+                            </button>
+                            <button class="btn btn-secondary" style="padding: 10px 14px;" onclick="clearLogs()" data-tooltip="Clear Logs">
+                                🗑️
+                            </button>
+                        </div>
+                    </div>
+                    <div id="log-container" class="logs-container" style="flex: 1; overflow-y: auto;">
+                        <div id="log-content">
+                            <div class="log-entry" style="color: var(--text-muted);">
+                                <span class="loading-dots"><span></span><span></span><span></span></span> Loading logs...
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings Section -->
+            <div id="section-settings" class="section">
+                <div class="grid-2">
+                    <div class="card">
+                        <div class="section-header">
+                            <h3>🎯 Generation Parameters</h3>
+                        </div>
+                        <div style="background: rgba(255, 193, 7, 0.1); border: 1px solid rgba(255, 193, 7, 0.3); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;">
+                            <p style="margin: 0; font-size: 12px; color: #ffc107;">
+                                <strong>⚠️ Warning:</strong> From testing, these parameters may not work reliably due to LMArena's backend configurations. Use at your own risk.
+                            </p>
+                        </div>
+                        <form action="/update-generation-settings" method="post">
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                                <div class="form-group">
+                                    <label class="form-label">Temperature</label>
+                                    <input type="number" class="form-input" name="default_temperature" value="{default_temp}" step="0.1" min="0" max="2">
+                                    <small style="color: var(--text-muted); font-size: 11px;">Controls randomness (0-2)</small>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Top P (Nucleus)</label>
+                                    <input type="number" class="form-input" name="default_top_p" value="{default_top_p}" step="0.05" min="0" max="1">
+                                    <small style="color: var(--text-muted); font-size: 11px;">Nucleus sampling (0-1)</small>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Max Output Tokens</label>
+                                    <input type="number" class="form-input" name="default_max_tokens" value="{default_max_tokens}" min="1" max="128000">
+                                    <small style="color: var(--text-muted); font-size: 11px;">Maximum response length</small>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Presence Penalty</label>
+                                    <input type="number" class="form-input" name="default_presence_penalty" value="{default_pres_pen}" step="0.1" min="-2" max="2">
+                                    <small style="color: var(--text-muted); font-size: 11px;">Penalize repeated topics (-2 to 2)</small>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Frequency Penalty</label>
+                                    <input type="number" class="form-input" name="default_frequency_penalty" value="{default_freq_pen}" step="0.1" min="-2" max="2">
+                                    <small style="color: var(--text-muted); font-size: 11px;">Penalize repeated words (-2 to 2)</small>
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-primary" style="margin-top: 8px;">
+                                <span>💾</span> Save Generation Settings
+                            </button>
+                        </form>
+                    </div>
+
+                    <div class="card">
+                        <div class="section-header">
+                            <h3>⚙️ Advanced Configuration</h3>
+                        </div>
+                        <form action="/update-collection-settings" method="post">
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                                <div class="form-group">
+                                    <label class="form-label">Chunk Size (chars)</label>
+                                    <input type="number" class="form-input" name="chunk_size" value="{chunk_size}" min="1000" step="1000">
+                                    <small style="color: var(--text-muted); font-size: 11px;">Max prompt chunk size</small>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Rotation Limit</label>
+                                    <input type="number" class="form-input" name="chunk_rotation_limit" value="{chunk_rotation_limit}" min="1" max="20">
+                                    <small style="color: var(--text-muted); font-size: 11px;">Chunks before session rotation</small>
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-primary" style="margin-top: 8px;">
+                                <span>💾</span> Save Advanced Settings
+                            </button>
+                        </form>
+                    </div>
+                </div>
+
+                <div class="grid-2" style="margin-top: 24px;">
+                    <div class="card">
+                        <div class="section-header">
+                            <h3>💻 System Info</h3>
+                        </div>
+                        <div class="system-info">
+                            <div class="system-info-row">
+                                <span class="system-info-label">Debug Mode</span>
+                                <span class="system-info-value" style="color: {'var(--success)' if DEBUG else 'var(--text-muted)'};">{'Enabled' if DEBUG else 'Disabled'}</span>
+                            </div>
+                            <div class="system-info-row">
+                                <span class="system-info-label">Port</span>
+                                <span class="system-info-value">{PORT}</span>
+                            </div>
+                            <div class="system-info-row">
+                                <span class="system-info-label">Chunk Size</span>
+                                <span class="system-info-value">{CHUNK_SIZE:,}</span>
+                            </div>
+                            <div class="system-info-row">
+                                <span class="system-info-label">Rotation Limit</span>
+                                <span class="system-info-value">{CHUNK_ROTATION_LIMIT}</span>
+                            </div>
+                            <div class="system-info-row">
+                                <span class="system-info-label">Sticky Sessions</span>
+                                <span class="system-info-value" style="color: {'var(--success)' if STICKY_SESSIONS else 'var(--text-muted)'};">{'Enabled' if STICKY_SESSIONS else 'Disabled'}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div style="text-align: center; padding: 24px; background: linear-gradient(135deg, var(--bg-dark) 0%, rgba(59, 130, 246, 0.05) 100%); border-radius: 16px; border: 1px solid var(--border);">
+                            <div style="font-size: 56px; margin-bottom: 16px; filter: drop-shadow(0 0 20px var(--primary-glow)); animation: pulse-glow 3s infinite;">🚀</div>
+                            <h2 style="margin-bottom: 8px; font-size: 24px; background: linear-gradient(135deg, var(--text-main), var(--primary-light)); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">LMArena Bridge</h2>
+                            <p style="color: var(--text-muted); font-size: 14px;">High-performance API proxy</p>
+                            <div style="margin-top: 16px; font-size: 12px; color: var(--text-muted);">
+                                Made with ❤️ by <span style="color: var(--primary-light);">@rumoto</span> & <span style="color: var(--primary-light);">@norenaboi</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Profile Section -->
+            <div id="section-profile" class="section">
+                <div class="grid-2">
+                    <div class="card">
+                        <div class="section-header">
+                            <h3>👤 Profile Settings</h3>
+                        </div>
+                        <form action="/update-profile" method="post">
+                            <div style="text-align: center; margin-bottom: 32px;">
+                                <div class="profile-avatar-large" style="width: 100px; height: 100px; background: linear-gradient(135deg, var(--primary), var(--primary-dark)); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 48px; margin: 0 auto 16px; box-shadow: 0 8px 32px var(--primary-glow); border: 3px solid var(--border);">
+                                    {config.get('profile_avatar', '👤')}
+                                </div>
+                                <div style="font-size: 20px; font-weight: 600; color: var(--text-main);">{config.get('profile_name', 'Admin User')}</div>
+                                <div style="font-size: 13px; color: var(--text-muted); margin-top: 4px;">Dashboard Administrator</div>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label class="form-label">Display Name</label>
+                                <input type="text" class="form-input" name="profile_name" value="{config.get('profile_name', 'Admin User')}" placeholder="Enter your name" maxlength="30">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label class="form-label">Profile Avatar</label>
+                                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">Choose an emoji or type a single character</p>
+                                <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;">
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='👤'">👤</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='😎'">😎</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='🧑‍💻'">🧑‍💻</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='🚀'">🚀</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='⭐'">⭐</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='🔥'">🔥</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='💎'">💎</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='🎯'">🎯</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='🌟'">🌟</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='👑'">👑</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='🦊'">🦊</button>
+                                    <button type="button" class="avatar-option" onclick="document.querySelector('[name=profile_avatar]').value='🐱'">🐱</button>
+                                </div>
+                                <input type="text" class="form-input" name="profile_avatar" value="{config.get('profile_avatar', '👤')}" placeholder="Or type a character" maxlength="2" style="text-align: center; font-size: 24px;">
+                            </div>
+                            
+                            <button type="submit" class="btn btn-primary" style="width: 100%;">
+                                <span>💾</span> Save Profile
+                            </button>
+                        </form>
+                    </div>
+
+                    <div class="card">
+                        <div class="section-header">
+                            <h3>📊 Your Activity</h3>
+                        </div>
+                        <div class="system-info">
+                            <div class="system-info-row">
+                                <span class="system-info-label">Total Requests Made</span>
+                                <span class="system-info-value">{total_requests:,}</span>
+                            </div>
+                            <div class="system-info-row">
+                                <span class="system-info-label">Active API Keys</span>
+                                <span class="system-info-value">{len(api_keys)}</span>
+                            </div>
+                            <div class="system-info-row">
+                                <span class="system-info-label">Auth Tokens</span>
+                                <span class="system-info-value">{len(auth_tokens)}</span>
+                            </div>
+                            <div class="system-info-row">
+                                <span class="system-info-label">Session Uptime</span>
+                                <span class="system-info-value">{uptime_str}</span>
+                            </div>
+                        </div>
+                        
+                        <div style="margin-top: 32px; padding: 20px; background: linear-gradient(135deg, var(--bg-dark) 0%, rgba(16, 185, 129, 0.05) 100%); border-radius: 16px; border: 1px solid var(--border);">
+                            <div style="display: flex; align-items: center; gap: 16px;">
+                                <div style="width: 48px; height: 48px; background: linear-gradient(135deg, var(--success), #059669); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 24px;">
+                                    ✓
+                                </div>
+                                <div>
+                                    <div style="font-weight: 600; color: var(--text-main); margin-bottom: 4px;">Account Active</div>
+                                    <div style="font-size: 13px; color: var(--text-muted);">All systems operational</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        // Generate background particles
+        function createParticles() {{
+            const container = document.getElementById('particles');
+            const particleCount = 30;
+            for (let i = 0; i < particleCount; i++) {{
+                const particle = document.createElement('div');
+                particle.className = 'particle';
+                particle.style.left = Math.random() * 100 + '%';
+                particle.style.animationDelay = Math.random() * 15 + 's';
+                particle.style.animationDuration = (10 + Math.random() * 10) + 's';
+                container.appendChild(particle);
+            }}
+        }}
+        createParticles();
+
+        // Sidebar Toggle
+        function toggleSidebar() {{
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebarOverlay');
+            sidebar.classList.toggle('open');
+            overlay.classList.toggle('active');
+        }}
+
+        function closeSidebar() {{
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebarOverlay');
+            sidebar.classList.remove('open');
+            overlay.classList.remove('active');
+        }}
+
+        // Ripple Effect for buttons
+        document.querySelectorAll('.btn').forEach(btn => {{
+            btn.addEventListener('click', function(e) {{
+                const rect = this.getBoundingClientRect();
+                const ripple = document.createElement('span');
+                ripple.className = 'ripple';
+                ripple.style.left = (e.clientX - rect.left) + 'px';
+                ripple.style.top = (e.clientY - rect.top) + 'px';
+                this.appendChild(ripple);
+                setTimeout(() => ripple.remove(), 600);
+            }});
+        }});
+
+        // Section Navigation with animation
+        function showSection(name) {{
+            // Update UI
+            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+            document.getElementById('section-' + name).classList.add('active');
+            
+            document.querySelectorAll('.nav-item').forEach(l => l.classList.remove('active'));
+            event.currentTarget.classList.add('active');
+            
+            // Update Title with animation
+            const titleEl = document.getElementById('page-title');
+            titleEl.style.opacity = '0';
+            titleEl.style.transform = 'translateY(-10px)';
+            
+            const titles = {{
+                'dashboard': '📊 Dashboard',
+                'models': '🤖 Models',
+                'leaderboard': '🏆 Leaderboard',
+                'keys': '🔑 API Keys',
+                'auth': '🛡️ Auth Tokens',
+                'logs': '📜 Live Logs',
+                'settings': '⚙️ Settings',
+                'profile': '👤 Profile'
+            }};
+            
+            setTimeout(() => {{
+                titleEl.textContent = titles[name];
+                titleEl.style.opacity = '1';
+                titleEl.style.transform = 'translateY(0)';
+            }}, 150);
+
+            // Handle Polling
+            if (name === 'logs') startLogsPolling();
+            else stopLogsPolling();
+            
+            if (name === 'auth') updateCollectionStatus();
+            
+            // Close sidebar on mobile
+            if (window.innerWidth <= 768) {{
+                closeSidebar();
+            }}
+        }}
+
+        // Add transition to page title
+        document.getElementById('page-title').style.transition = 'all 0.3s ease';
+
+        // Charts with enhanced styling
+        const statsData = {json.dumps(top_models)};
+        const modelNames = Object.keys(statsData).slice(0, 10);
+        const modelCounts = Object.values(statsData).slice(0, 10);
+        
+        const colors = [
+            '#3b82f6', '#6366f1', '#8b5cf6', '#a855f7', '#d946ef',
+            '#ec4899', '#f43f5e', '#f97316', '#eab308', '#10b981'
+        ];
+
+        const gradientColors = colors.map(color => {{
+            return color;
+        }});
+        
+        if (modelNames.length > 0) {{
+            Chart.defaults.color = '#94a3b8';
+            Chart.defaults.borderColor = '#1e3a5f';
+            Chart.defaults.font.family = "'Inter', sans-serif";
+            
+            const pieChart = new Chart(document.getElementById('modelPieChart'), {{
+                type: 'doughnut',
+                data: {{
+                    labels: modelNames,
+                    datasets: [{{
+                        data: modelCounts,
+                        backgroundColor: colors,
+                        borderWidth: 2,
+                        borderColor: '#0a1628',
+                        hoverOffset: 8,
+                        hoverBorderWidth: 3,
+                        hoverBorderColor: '#ffffff'
+                    }}]
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    cutout: '65%',
+                    plugins: {{
+                        legend: {{ 
+                            position: 'right', 
+                            labels: {{ 
+                                boxWidth: 12,
+                                padding: 16,
+                                usePointStyle: true,
+                                pointStyle: 'circle'
                             }}
                         }}
-                    }});
-                    
-                    // Bar Chart
-                    new Chart(document.getElementById('modelBarChart'), {{
-                        type: 'bar',
-                        data: {{
-                            labels: modelNames,
-                            datasets: [{{
-                                label: 'Requests',
-                                data: modelCounts,
-                                backgroundColor: colors[0],
-                                borderRadius: 6
-                            }}]
-                        }},
-                        options: {{
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            plugins: {{
-                                legend: {{ display: false }}
-                            }},
-                            scales: {{
-                                y: {{
-                                    beginAtZero: true,
-                                    grid: {{ color: '#334155' }},
-                                    ticks: {{ color: '#94a3b8' }}
-                                }},
-                                x: {{
-                                    grid: {{ display: false }},
-                                    ticks: {{ color: '#94a3b8', font: {{ size: 10 }}, maxRotation: 45 }}
-                                }}
-                            }}
-                        }}
-                    }});
-                }}
-                
-                // Show toast if success param
-                if (window.location.search.includes('success')) {{
-                    const toast = document.createElement('div');
-                    toast.className = 'toast';
-                    toast.textContent = '✅ Settings saved successfully!';
-                    document.body.appendChild(toast);
-                    setTimeout(() => toast.remove(), 3000);
-                    history.replaceState(null, '', '/dashboard');
-                }}
-                
-                // === Token Collection Functions ===
-                let collectionInterval = null;
-                
-                async function startCollection() {{
-                    const count = document.getElementById('collect-count').value;
-                    const delay = document.getElementById('collect-delay').value;
-                    
-                    const formData = new FormData();
-                    formData.append('count', count);
-                    formData.append('delay', delay);
-                    
-                    try {{
-                        const response = await fetch('/start-token-collection', {{
-                            method: 'POST',
-                            body: formData
-                        }});
-                        const data = await response.json();
-                        
-                        if (data.error) {{
-                            alert(data.error);
-                            return;
-                        }}
-                        
-                        document.getElementById('start-collection-btn').style.display = 'none';
-                        document.getElementById('stop-collection-btn').style.display = 'inline-flex';
-                        
-                        // Start polling for status
-                        collectionInterval = setInterval(updateCollectionStatus, 1000);
-                        updateCollectionStatus();
-                    }} catch (e) {{
-                        console.error('Error starting collection:', e);
-                        alert('Error starting collection');
+                    }},
+                    animation: {{
+                        animateRotate: true,
+                        animateScale: true,
+                        duration: 1000,
+                        easing: 'easeOutQuart'
                     }}
                 }}
+            }});
+            
+            // Bar chart removed - replaced with static LMArena top models list
+        }}
+
+        // Token Collection Logic with enhanced UI
+        let collectionInterval = null;
+        
+        async function startCollection() {{
+            const count = document.getElementById('collect-count').value;
+            const delay = document.getElementById('collect-delay').value;
+            const formData = new FormData();
+            formData.append('count', count);
+            formData.append('delay', delay);
+            
+            const startBtn = document.getElementById('start-collection-btn');
+            startBtn.innerHTML = '<span class="loading-dots"><span></span><span></span><span></span></span> Starting...';
+            startBtn.disabled = true;
+            
+            try {{
+                const response = await fetch('/start-token-collection', {{ method: 'POST', body: formData }});
+                const data = await response.json();
+                if (data.error) {{ 
+                    alert(data.error); 
+                    startBtn.innerHTML = '<span>▶</span> Start Collection';
+                    startBtn.disabled = false;
+                    return; 
+                }}
                 
-                async function stopCollection() {{
-                    try {{
-                        await fetch('/stop-token-collection', {{ method: 'POST' }});
-                        
-                        if (collectionInterval) {{
-                            clearInterval(collectionInterval);
-                            collectionInterval = null;
-                        }}
-                        
+                startBtn.style.display = 'none';
+                startBtn.innerHTML = '<span>▶</span> Start Collection';
+                startBtn.disabled = false;
+                document.getElementById('stop-collection-btn').style.display = 'inline-flex';
+                collectionInterval = setInterval(updateCollectionStatus, 1000);
+                updateCollectionStatus();
+            }} catch (e) {{ 
+                alert('Error starting collection');
+                startBtn.innerHTML = '<span>▶</span> Start Collection';
+                startBtn.disabled = false;
+            }}
+        }}
+
+        async function stopCollection() {{
+            try {{
+                await fetch('/stop-token-collection', {{ method: 'POST' }});
+                if (collectionInterval) {{ clearInterval(collectionInterval); collectionInterval = null; }}
+                document.getElementById('start-collection-btn').style.display = 'inline-flex';
+                document.getElementById('stop-collection-btn').style.display = 'none';
+                updateCollectionStatus();
+            }} catch (e) {{ console.error(e); }}
+        }}
+
+        async function refreshCloudflare() {{
+            const btn = document.getElementById('refresh-cf-btn');
+            const statusEl = document.getElementById('cf-refresh-status');
+            
+            btn.innerHTML = '<span class="loading-dots"><span></span><span></span><span></span></span> Refreshing...';
+            btn.disabled = true;
+            statusEl.style.display = 'block';
+            statusEl.innerHTML = '⏳ Refreshing Cloudflare session...';
+            statusEl.style.color = 'var(--text-muted)';
+            
+            try {{
+                const response = await fetch('/refresh-tokens', {{ method: 'POST' }});
+                if (response.redirected || response.ok) {{
+                    statusEl.innerHTML = '✅ Cloudflare session refreshed! Reloading page...';
+                    statusEl.style.color = 'var(--success)';
+                    setTimeout(() => window.location.reload(), 1500);
+                }} else {{
+                    throw new Error('Refresh failed');
+                }}
+            }} catch (e) {{
+                statusEl.innerHTML = '❌ Failed to refresh. Check console for details.';
+                statusEl.style.color = 'var(--error)';
+                btn.innerHTML = '<span>☁️</span> Refresh Cloudflare';
+                btn.disabled = false;
+                console.error('Cloudflare refresh error:', e);
+            }}
+        }}
+
+        async function updateCollectionStatus() {{
+            try {{
+                const response = await fetch('/token-collection-status');
+                const data = await response.json();
+                
+                const statusEl = document.getElementById('collection-status');
+                statusEl.innerHTML = data.current_status;
+                
+                document.getElementById('progress-text').textContent = `${{data.collected}} / ${{data.target}}`;
+                const percent = data.target > 0 ? (data.collected / data.target) * 100 : 0;
+                document.getElementById('progress-bar').style.width = `${{percent}}%`;
+                
+                const badge = document.getElementById('collection-badge');
+                const badgeText = document.getElementById('badge-text');
+                
+                badge.classList.remove('idle', 'running', 'done');
+                
+                if (data.running) {{
+                    badge.classList.add('running');
+                    badgeText.textContent = '⚡ Running';
+                }} else {{
+                    if (data.collected > 0) {{
+                        badge.classList.add('done');
+                        badgeText.textContent = '✅ Done';
+                    }} else {{
+                        badge.classList.add('idle');
+                        badgeText.textContent = '💤 Idle';
+                    }}
+                    
+                    if (collectionInterval && !data.running) {{
+                        clearInterval(collectionInterval);
+                        collectionInterval = null;
                         document.getElementById('start-collection-btn').style.display = 'inline-flex';
                         document.getElementById('stop-collection-btn').style.display = 'none';
-                    }} catch (e) {{
-                        console.error('Error stopping collection:', e);
                     }}
                 }}
-                
-                async function updateCollectionStatus() {{
-                    try {{
-                        const response = await fetch('/token-collection-status');
-                        const data = await response.json();
-                        
-                        document.getElementById('collection-status').textContent = data.current_status;
-                        document.getElementById('progress-text').textContent = `${{data.collected}} / ${{data.target}}`;
-                        
-                        const percent = data.target > 0 ? (data.collected / data.target) * 100 : 0;
-                        document.getElementById('progress-bar').style.width = `${{percent}}%`;
-                        
-                        const badge = document.getElementById('collection-badge');
-                        if (data.running) {{
-                            badge.textContent = 'Running...';
-                            badge.style.background = 'var(--primary)';
-                            badge.style.color = 'white';
-                        }} else {{
-                            badge.textContent = data.collected > 0 ? `Done (${{data.collected}})` : 'Idle';
-                            badge.style.background = data.collected > 0 ? 'var(--success)' : 'var(--bg)';
-                            badge.style.color = data.collected > 0 ? 'white' : 'var(--text-muted)';
-                            
-                            // Stop polling when done
-                            if (collectionInterval) {{
-                                clearInterval(collectionInterval);
-                                collectionInterval = null;
-                            }}
-                            document.getElementById('start-collection-btn').style.display = 'inline-flex';
-                            document.getElementById('stop-collection-btn').style.display = 'none';
-                        }}
-                    }} catch (e) {{
-                        console.error('Error fetching status:', e);
-                    }}
-                }}
-                
-                // === Live Logs Functions ===
-                let autoScroll = true;
-                let logsInterval = null;
-                
-                function toggleAutoScroll() {{
-                    autoScroll = !autoScroll;
-                    document.getElementById('autoscroll-icon').textContent = autoScroll ? '⏬' : '⏸️';
-                }}
-                
-                async function fetchLogs() {{
-                    try {{
-                        const response = await fetch('/api/logs?limit=200');
-                        const data = await response.json();
-                        
-                        if (data.logs) {{
-                            const container = document.getElementById('log-content');
-                            const levelColors = {{
-                                'INFO': '#58a6ff',
-                                'SUCCESS': '#3fb950',
-                                'WARN': '#d29922',
-                                'ERROR': '#f85149',
-                                'DEBUG': '#8b949e'
-                            }};
-                            
-                            container.innerHTML = data.logs.map(log => {{
-                                const color = levelColors[log.level] || '#8b949e';
-                                return `<div style="margin-bottom: 4px;"><span style="color: #6e7681;">${{log.timestamp}}</span> <span style="color: ${{color}};">[${{log.level}}]</span> ${{log.message}}</div>`;
-                            }}).join('');
-                            
-                            if (autoScroll) {{
-                                const logContainer = document.getElementById('log-container');
-                                logContainer.scrollTop = logContainer.scrollHeight;
-                            }}
-                        }}
-                    }} catch (e) {{
-                        console.error('Error fetching logs:', e);
-                    }}
-                }}
-                
-                async function clearLogs() {{
-                    try {{
-                        await fetch('/api/clear-logs', {{ method: 'POST' }});
-                        document.getElementById('log-content').innerHTML = '<div style="color: #6e7681;">Logs cleared</div>';
-                    }} catch (e) {{
-                        console.error('Error clearing logs:', e);
-                    }}
-                }}
-                
-                // Start logs polling when on logs section
-                function startLogsPolling() {{
-                    if (!logsInterval) {{
-                        fetchLogs();
-                        logsInterval = setInterval(fetchLogs, 2000);
-                    }}
-                }}
-                
-                function stopLogsPolling() {{
-                    if (logsInterval) {{
-                        clearInterval(logsInterval);
-                        logsInterval = null;
-                    }}
-                }}
-                
-                // Modify showSection to handle logs polling
-                const originalShowSection = showSection;
-                showSection = function(name) {{
-                    // Hide all sections
-                    document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-                    // Show selected section
-                    document.getElementById('section-' + name).classList.add('active');
-                    // Update nav
-                    document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
-                    event.target.closest('.nav-link').classList.add('active');
+            }} catch (e) {{ console.error(e); }}
+        }}
+
+        // Logs Logic with enhanced styling
+        let autoScroll = true;
+        let logsInterval = null;
+        
+        function toggleAutoScroll() {{
+            autoScroll = !autoScroll;
+            const icon = document.getElementById('autoscroll-icon');
+            icon.textContent = autoScroll ? '⏬' : '⏸️';
+            icon.style.transform = 'scale(1.2)';
+            setTimeout(() => icon.style.transform = 'scale(1)', 200);
+        }}
+
+        async function fetchLogs() {{
+            try {{
+                const response = await fetch('/api/logs?limit=200');
+                const data = await response.json();
+                if (data.logs) {{
+                    const container = document.getElementById('log-content');
+                    const levelClasses = {{ 
+                        'INFO': 'log-level-info', 
+                        'SUCCESS': 'log-level-success', 
+                        'WARN': 'log-level-warn', 
+                        'ERROR': 'log-level-error', 
+                        'DEBUG': 'log-level-debug' 
+                    }};
                     
-                    // Handle logs polling
-                    if (name === 'logs') {{
-                        startLogsPolling();
-                    }} else {{
-                        stopLogsPolling();
-                    }}
+                    container.innerHTML = data.logs.map(log => {{
+                        const levelClass = levelClasses[log.level] || 'log-level-debug';
+                        return `<div class="log-entry">
+                            <span class="log-timestamp">${{log.timestamp}}</span> 
+                            <span class="log-level ${{levelClass}}">${{log.level}}</span> 
+                            <span class="log-message">${{log.message}}</span>
+                        </div>`;
+                    }}).join('');
                     
-                    // Handle collection status polling
-                    if (name === 'auth') {{
-                        updateCollectionStatus();
+                    if (autoScroll) {{
+                        const logContainer = document.getElementById('log-container');
+                        logContainer.scrollTop = logContainer.scrollHeight;
                     }}
+                }}
+            }} catch (e) {{ console.error(e); }}
+        }}
+
+        async function clearLogs() {{
+            await fetch('/api/clear-logs', {{ method: 'POST' }});
+            document.getElementById('log-content').innerHTML = '<div class="log-entry" style="color: var(--text-muted);">🗑️ Logs cleared</div>';
+        }}
+
+        // Leaderboard functionality
+        let leaderboardRefreshing = false;
+        
+        async function loadLeaderboard() {{
+            // Just load cached data (quick)
+            const loading = document.getElementById('leaderboard-loading');
+            const error = document.getElementById('leaderboard-error');
+            const tableContainer = document.getElementById('leaderboard-table-container');
+            const updatedEl = document.getElementById('leaderboard-updated');
+            
+            loading.style.display = 'block';
+            error.style.display = 'none';
+            tableContainer.style.opacity = '0.5';
+            
+            try {{
+                const response = await fetch('/api/leaderboard?category=overall');
+                if (!response.ok) throw new Error('Failed to fetch');
+                
+                const data = await response.json();
+                
+                if (data.last_updated) {{
+                    updatedEl.textContent = `Last updated: ${{data.last_updated}}`;
+                }}
+                
+                renderLeaderboard(data);
+                loading.style.display = 'none';
+                tableContainer.style.opacity = '1';
+            }} catch (e) {{
+                console.error('Leaderboard error:', e);
+                loading.style.display = 'none';
+                error.style.display = 'block';
+                tableContainer.style.opacity = '1';
+            }}
+        }}
+        
+        async function refreshLeaderboard() {{
+            // Fetch fresh data using browser automation (slow but accurate)
+            if (leaderboardRefreshing) return;
+            leaderboardRefreshing = true;
+            
+            const loading = document.getElementById('leaderboard-loading');
+            const error = document.getElementById('leaderboard-error');
+            const tableContainer = document.getElementById('leaderboard-table-container');
+            const updatedEl = document.getElementById('leaderboard-updated');
+            const refreshBtn = document.querySelector('#section-leaderboard .btn-secondary');
+            
+            // Update UI for long operation
+            loading.style.display = 'block';
+            loading.innerHTML = '<div class="loading-dots"><span></span><span></span><span></span></div><p style="margin-top: 16px; color: var(--text-muted);">🌐 Fetching from LMArena using browser automation...<br><small>This may take 10-30 seconds (bypassing Cloudflare)</small></p>';
+            error.style.display = 'none';
+            tableContainer.style.opacity = '0.3';
+            if (refreshBtn) {{
+                refreshBtn.disabled = true;
+                refreshBtn.innerHTML = '⏳ Fetching...';
+            }}
+            
+            try {{
+                const response = await fetch('/api/leaderboard/refresh', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }}
+                }});
+                
+                const data = await response.json();
+                
+                if (data.last_updated) {{
+                    updatedEl.textContent = `Last updated: ${{data.last_updated}}`;
+                }}
+                
+                if (data.success) {{
+                    updatedEl.innerHTML = `✅ ${{data.message}} • ${{data.last_updated}}`;
+                }} else {{
+                    updatedEl.innerHTML = `⚠️ ${{data.message}} • Showing cached: ${{data.last_updated}}`;
+                }}
+                
+                renderLeaderboard(data);
+                loading.style.display = 'none';
+                tableContainer.style.opacity = '1';
+            }} catch (e) {{
+                console.error('Leaderboard refresh error:', e);
+                loading.style.display = 'none';
+                error.style.display = 'block';
+                error.innerHTML = '<div style="font-size: 48px; margin-bottom: 16px;">⚠️</div><p>Failed to refresh leaderboard</p><p style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">' + e.message + '</p><button class="btn btn-primary" onclick="loadLeaderboard()" style="margin-top: 16px;">Show Cached Data</button>';
+                tableContainer.style.opacity = '1';
+            }} finally {{
+                leaderboardRefreshing = false;
+                if (refreshBtn) {{
+                    refreshBtn.disabled = false;
+                    refreshBtn.innerHTML = '🔄 Refresh';
+                }}
+                // Reset loading text
+                loading.innerHTML = '<div class="loading-dots"><span></span><span></span><span></span></div><p style="margin-top: 16px; color: var(--text-muted);">Loading leaderboard data...</p>';
+            }}
+        }}
+        
+        function renderLeaderboard(data) {{
+            const tbody = document.getElementById('leaderboard-body');
+            
+            if (!data.models || data.models.length === 0) {{
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 40px;">No data available. Click Refresh to fetch rankings.</td></tr>';
+                return;
+            }}
+            
+            // Provider color mapping
+            const providerColors = {{
+                'OpenAI': '#10a37f',
+                'Anthropic': '#d4a27f',
+                'Google': '#4285f4',
+                'xAI': '#1da1f2',
+                'Meta': '#0668e1',
+                'Mistral': '#ff7000',
+                'DeepSeek': '#5b6ee1',
+                'Alibaba': '#ff6a00',
+                'Cohere': '#39594d',
+                'Microsoft': '#00a4ef',
+                'Nvidia': '#76b900',
+            }};
+            
+            let html = '';
+            data.models.slice(0, 50).forEach((model, index) => {{
+                const rank = model.rank || (index + 1);
+                const rankBadge = rank <= 3 ? 
+                    `<span style="background: ${{rank === 1 ? 'linear-gradient(135deg, #ffd700, #ffb700)' : rank === 2 ? 'linear-gradient(135deg, #c0c0c0, #a0a0a0)' : 'linear-gradient(135deg, #cd7f32, #a0522d)'}}; color: #000; padding: 4px 10px; border-radius: 8px; font-weight: 700;">${{rank}}</span>` :
+                    `<span style="color: var(--text-muted);">${{rank}}</span>`;
+                
+                const provider = model.provider || 'Unknown';
+                const providerColor = providerColors[provider] || 'var(--text-muted)';
+                const elo = model.elo || '-';
+                const ci = model.ci || '-';
+                const votes = model.votes || '-';
+                
+                html += `
+                    <tr style="animation: fadeIn 0.3s ease ${{index * 0.02}}s both;">
+                        <td style="text-align: center;">${{rankBadge}}</td>
+                        <td>
+                            <span style="color: ${{providerColor}}; font-weight: 500; font-size: 13px;">${{provider}}</span>
+                        </td>
+                        <td>
+                            <div style="font-weight: 600; color: var(--text-main);">${{model.name}}</div>
+                        </td>
+                        <td style="text-align: center;">
+                            <span style="font-weight: 600; color: var(--primary-light);">${{elo}}</span>
+                        </td>
+                        <td style="text-align: center; font-size: 12px; color: var(--text-muted);">${{ci}}</td>
+                        <td style="text-align: center; font-size: 12px; color: var(--text-secondary);">${{votes}}</td>
+                    </tr>
+                `;
+            }});
+            
+            tbody.innerHTML = html;
+        }}
+
+        function startLogsPolling() {{
+            if (!logsInterval) {{ fetchLogs(); logsInterval = setInterval(fetchLogs, 2000); }}
+        }}
+
+        function stopLogsPolling() {{
+            if (logsInterval) {{ clearInterval(logsInterval); logsInterval = null; }}
+        }}
+
+        // Card entrance animation
+        function animateCards() {{
+            const cards = document.querySelectorAll('.card');
+            cards.forEach((card, index) => {{
+                card.style.opacity = '0';
+                card.style.transform = 'translateY(20px)';
+                setTimeout(() => {{
+                    card.style.transition = 'all 0.5s cubic-bezier(0.4, 0, 0.2, 1)';
+                    card.style.opacity = '1';
+                    card.style.transform = 'translateY(0)';
+                }}, index * 100);
+            }});
+        }}
+
+        // Uptime counter
+        let uptimeSeconds = {int(time.time() - server_start_time)};
+        function updateUptime() {{
+            uptimeSeconds++;
+            const days = Math.floor(uptimeSeconds / 86400);
+            const hours = Math.floor((uptimeSeconds % 86400) / 3600);
+            const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+            const seconds = uptimeSeconds % 60;
+            
+            let parts = [];
+            if (days > 0) parts.push(days + 'd');
+            if (hours > 0) parts.push(hours + 'h');
+            if (minutes > 0) parts.push(minutes + 'm');
+            parts.push(seconds + 's');
+            
+            const uptimeEl = document.getElementById('uptime-value');
+            if (uptimeEl) uptimeEl.textContent = parts.join(' ');
+        }}
+        setInterval(updateUptime, 1000);
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {{
+            if (e.key === 'Escape' && window.innerWidth <= 768) {{
+                closeSidebar();
+            }}
+        }});
+
+        // Touch swipe for mobile sidebar - only for edge swipes, don't interfere with buttons
+        let touchStartX = 0;
+        let touchStartY = 0;
+        let touchEndX = 0;
+        let touchEndY = 0;
+        let isSwiping = false;
+        
+        document.addEventListener('touchstart', (e) => {{
+            touchStartX = e.changedTouches[0].screenX;
+            touchStartY = e.changedTouches[0].screenY;
+            isSwiping = false;
+            
+            // Only track swipes that start from the left edge (first 30px) or when sidebar is open
+            const sidebar = document.getElementById('sidebar');
+            if (touchStartX < 30 || sidebar.classList.contains('open')) {{
+                isSwiping = true;
+            }}
+        }}, {{ passive: true }});
+        
+        document.addEventListener('touchmove', (e) => {{
+            // If it's a horizontal swipe from edge, prevent scroll
+            if (isSwiping) {{
+                const currentX = e.changedTouches[0].screenX;
+                const currentY = e.changedTouches[0].screenY;
+                const diffX = Math.abs(currentX - touchStartX);
+                const diffY = Math.abs(currentY - touchStartY);
+                
+                // If mostly horizontal movement, it's a swipe
+                if (diffX > diffY && diffX > 10) {{
+                    // Don't prevent default - let the swipe happen naturally
+                }}
+            }}
+        }}, {{ passive: true }});
+        
+        document.addEventListener('touchend', (e) => {{
+            if (!isSwiping) return;
+            
+            touchEndX = e.changedTouches[0].screenX;
+            touchEndY = e.changedTouches[0].screenY;
+            
+            const diffX = touchEndX - touchStartX;
+            const diffY = Math.abs(touchEndY - touchStartY);
+            const swipeThreshold = 60;
+            
+            // Only handle if horizontal swipe is dominant
+            if (Math.abs(diffX) > diffY && Math.abs(diffX) > swipeThreshold) {{
+                if (diffX > 0 && touchStartX < 30) {{
+                    // Swipe right from left edge - open sidebar
+                    document.getElementById('sidebar').classList.add('open');
+                    document.getElementById('sidebarOverlay').classList.add('active');
+                }} else if (diffX < 0) {{
+                    // Swipe left - close sidebar
+                    closeSidebar();
+                }}
+            }}
+            
+            isSwiping = false;
+        }}, {{ passive: true }});
+
+        // Load top 7 models preview from leaderboard cache
+        async function loadTopModelsPreview() {{
+            const container = document.getElementById('top-models-list');
+            if (!container) return;
+            
+            try {{
+                const response = await fetch('/api/leaderboard?category=overall');
+                if (!response.ok) throw new Error('Failed to fetch');
+                const data = await response.json();
+                
+                if (!data.models || data.models.length === 0) {{
+                    container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 20px;">No leaderboard data. Click Refresh in Leaderboard tab.</div>';
+                    return;
+                }}
+                
+                const providerColors = {{
+                    'OpenAI': '#10a37f',
+                    'Anthropic': '#d4a27f',
+                    'Google': '#4285f4',
+                    'xAI': '#1da1f2',
+                    'Meta': '#0668e1',
+                    'Mistral': '#ff7000',
+                    'DeepSeek': '#5b6ee1',
+                    'Alibaba': '#ff6a00',
                 }};
                 
-                // Initial status check
-                updateCollectionStatus();
-            </script>
-        </body>
-        </html>
+                let html = '';
+                data.models.slice(0, 7).forEach((model, index) => {{
+                    const rank = index + 1;
+                    const provider = model.provider || 'Unknown';
+                    const providerColor = providerColors[provider] || 'var(--text-muted)';
+                    const elo = model.elo || '-';
+                    
+                    if (rank <= 3) {{
+                        const colors = ['#ffd700', '#c0c0c0', '#cd7f32'];
+                        const bgColors = ['rgba(255,215,0,0.15)', 'rgba(192,192,192,0.12)', 'rgba(205,127,50,0.12)'];
+                        html += `
+                            <div style="display: flex; align-items: center; gap: 12px; padding: 10px 14px; background: linear-gradient(90deg, ${{bgColors[rank-1]}}, transparent); border-radius: 10px; border-left: 3px solid ${{colors[rank-1]}};">
+                                <span style="font-size: 18px; font-weight: 800; color: ${{colors[rank-1]}}; width: 24px;">${{rank}}</span>
+                                <div style="flex: 1;"><div style="font-weight: 600; color: var(--text-main);">${{model.name}}</div><div style="font-size: 11px; color: ${{providerColor}};">${{provider}}</div></div>
+                                <span class="badge" style="font-size: 11px;">${{elo}}</span>
+                            </div>
+                        `;
+                    }} else {{
+                        html += `
+                            <div style="display: flex; align-items: center; gap: 12px; padding: 8px 14px; background: var(--bg-dark); border-radius: 10px;">
+                                <span style="font-size: 14px; font-weight: 700; color: var(--text-muted); width: 24px;">${{rank}}</span>
+                                <div style="flex: 1;"><div style="font-weight: 500; color: var(--text-secondary);">${{model.name}}</div><div style="font-size: 11px; color: ${{providerColor}};">${{provider}}</div></div>
+                                <span style="font-size: 11px; color: var(--text-muted);">${{elo}}</span>
+                            </div>
+                        `;
+                    }}
+                }});
+                
+                container.innerHTML = html;
+            }} catch (e) {{
+                console.error('Error loading top models:', e);
+                container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 20px;">Failed to load. Click to view Leaderboard.</div>';
+            }}
+        }}
+
+        // Init
+        updateCollectionStatus();
+        animateCards();
+        loadTopModelsPreview();
+        
+        // Add smooth hover effect to table rows
+        document.querySelectorAll('tbody tr').forEach(row => {{
+            row.addEventListener('mouseenter', function() {{
+                this.style.transform = 'scale(1.01)';
+            }});
+            row.addEventListener('mouseleave', function() {{
+                this.style.transform = 'scale(1)';
+            }});
+        }});
+
+        // Input focus effects
+        document.querySelectorAll('.form-input').forEach(input => {{
+            input.addEventListener('focus', function() {{
+                this.parentElement.style.transform = 'scale(1.02)';
+            }});
+            input.addEventListener('blur', function() {{
+                this.parentElement.style.transform = 'scale(1)';
+            }});
+        }});
+
+        console.log('%c🚀 LMArena Bridge Dashboard', 'font-size: 20px; font-weight: bold; color: #3b82f6;');
+        console.log('%cWelcome to the enhanced dashboard!', 'font-size: 12px; color: #94a3b8;');
+    </script>
+</body>
+</html>
     """
 
 @app.post("/update-auth-tokens")
@@ -2790,23 +4702,532 @@ async def clear_logs(request: Request):
     
     return {"success": True, "message": "Logs cleared"}
 
-@app.post("/update-collection-settings")
-async def update_collection_settings(
+# --- Leaderboard API ---
+# Static leaderboard data - updated on server startup
+import re
+
+LEADERBOARD_FILE = "leaderboard_cache.json"
+
+# Default hardcoded leaderboard data (fallback if fetch fails)
+DEFAULT_LEADERBOARD = {
+    "overall": [
+        {"rank": 1, "name": "gemini-3-pro", "provider": "Google", "elo": 1400, "ci": "±5", "votes": "50K"},
+        {"rank": 2, "name": "grok-4.1-thinking", "provider": "xAI", "elo": 1395, "ci": "±5", "votes": "45K"},
+        {"rank": 3, "name": "claude-opus-4-5-thinking", "provider": "Anthropic", "elo": 1390, "ci": "±5", "votes": "40K"},
+        {"rank": 4, "name": "grok-4.1", "provider": "xAI", "elo": 1385, "ci": "±5", "votes": "38K"},
+        {"rank": 5, "name": "claude-opus-4-5", "provider": "Anthropic", "elo": 1380, "ci": "±5", "votes": "35K"},
+        {"rank": 6, "name": "gpt-5.1-high", "provider": "OpenAI", "elo": 1375, "ci": "±5", "votes": "32K"},
+        {"rank": 7, "name": "gemini-2.5-pro", "provider": "Google", "elo": 1370, "ci": "±5", "votes": "30K"},
+        {"rank": 8, "name": "claude-sonnet-4-5-thinking", "provider": "Anthropic", "elo": 1365, "ci": "±5", "votes": "28K"},
+        {"rank": 9, "name": "claude-opus-4-1-thinking", "provider": "Anthropic", "elo": 1360, "ci": "±5", "votes": "25K"},
+        {"rank": 10, "name": "claude-sonnet-4-5", "provider": "Anthropic", "elo": 1355, "ci": "±5", "votes": "22K"},
+        {"rank": 11, "name": "gpt-4.5-preview", "provider": "OpenAI", "elo": 1350, "ci": "±5", "votes": "20K"},
+        {"rank": 12, "name": "claude-opus-4-1", "provider": "Anthropic", "elo": 1345, "ci": "±5", "votes": "18K"},
+        {"rank": 13, "name": "chatgpt-4o-latest", "provider": "OpenAI", "elo": 1340, "ci": "±5", "votes": "16K"},
+        {"rank": 14, "name": "gpt-5-high", "provider": "OpenAI", "elo": 1335, "ci": "±5", "votes": "15K"},
+        {"rank": 15, "name": "gpt-5.1", "provider": "OpenAI", "elo": 1330, "ci": "±5", "votes": "14K"},
+        {"rank": 16, "name": "o3", "provider": "OpenAI", "elo": 1325, "ci": "±5", "votes": "13K"},
+        {"rank": 17, "name": "qwen3-max", "provider": "Alibaba", "elo": 1320, "ci": "±5", "votes": "12K"},
+        {"rank": 18, "name": "grok-4-fast", "provider": "xAI", "elo": 1315, "ci": "±5", "votes": "11K"},
+        {"rank": 19, "name": "kimi-k2-thinking", "provider": "Moonshot", "elo": 1310, "ci": "±5", "votes": "10K"},
+        {"rank": 20, "name": "glm-4.6", "provider": "Zhipu", "elo": 1305, "ci": "±5", "votes": "9K"},
+        {"rank": 21, "name": "deepseek-r1", "provider": "DeepSeek", "elo": 1300, "ci": "±5", "votes": "8K"},
+        {"rank": 22, "name": "claude-3.5-sonnet", "provider": "Anthropic", "elo": 1295, "ci": "±5", "votes": "7K"},
+        {"rank": 23, "name": "gemini-2.0-ultra", "provider": "Google", "elo": 1290, "ci": "±5", "votes": "6K"},
+        {"rank": 24, "name": "gpt-4-turbo", "provider": "OpenAI", "elo": 1285, "ci": "±5", "votes": "5K"},
+        {"rank": 25, "name": "llama-4-405b", "provider": "Meta", "elo": 1280, "ci": "±5", "votes": "5K"},
+        {"rank": 26, "name": "mistral-large-2", "provider": "Mistral", "elo": 1275, "ci": "±5", "votes": "4K"},
+        {"rank": 27, "name": "qwen-2.5-72b", "provider": "Alibaba", "elo": 1270, "ci": "±5", "votes": "4K"},
+        {"rank": 28, "name": "command-r-plus", "provider": "Cohere", "elo": 1265, "ci": "±5", "votes": "3K"},
+        {"rank": 29, "name": "yi-large", "provider": "01.AI", "elo": 1260, "ci": "±5", "votes": "3K"},
+        {"rank": 30, "name": "claude-3-opus", "provider": "Anthropic", "elo": 1255, "ci": "±5", "votes": "3K"},
+        {"rank": 31, "name": "gemini-1.5-pro", "provider": "Google", "elo": 1250, "ci": "±5", "votes": "2K"},
+        {"rank": 32, "name": "gpt-4o", "provider": "OpenAI", "elo": 1245, "ci": "±5", "votes": "2K"},
+        {"rank": 33, "name": "llama-3.1-405b", "provider": "Meta", "elo": 1240, "ci": "±5", "votes": "2K"},
+        {"rank": 34, "name": "deepseek-v3", "provider": "DeepSeek", "elo": 1235, "ci": "±5", "votes": "2K"},
+        {"rank": 35, "name": "nemotron-4-340b", "provider": "Nvidia", "elo": 1230, "ci": "±5", "votes": "1K"},
+        {"rank": 36, "name": "phi-4", "provider": "Microsoft", "elo": 1225, "ci": "±5", "votes": "1K"},
+        {"rank": 37, "name": "wizardlm-2-8x22b", "provider": "Microsoft", "elo": 1220, "ci": "±5", "votes": "1K"},
+        {"rank": 38, "name": "reka-core", "provider": "Reka", "elo": 1215, "ci": "±5", "votes": "1K"},
+        {"rank": 39, "name": "dbrx-instruct", "provider": "Databricks", "elo": 1210, "ci": "±5", "votes": "1K"},
+        {"rank": 40, "name": "mixtral-8x22b", "provider": "Mistral", "elo": 1205, "ci": "±5", "votes": "1K"},
+        {"rank": 41, "name": "claude-3-sonnet", "provider": "Anthropic", "elo": 1200, "ci": "±5", "votes": "1K"},
+        {"rank": 42, "name": "gemma-2-27b", "provider": "Google", "elo": 1195, "ci": "±5", "votes": "1K"},
+        {"rank": 43, "name": "llama-3-70b", "provider": "Meta", "elo": 1190, "ci": "±5", "votes": "1K"},
+        {"rank": 44, "name": "qwen-72b", "provider": "Alibaba", "elo": 1185, "ci": "±5", "votes": "1K"},
+        {"rank": 45, "name": "yi-34b", "provider": "01.AI", "elo": 1180, "ci": "±5", "votes": "1K"},
+        {"rank": 46, "name": "starling-lm-7b", "provider": "Berkeley", "elo": 1175, "ci": "±5", "votes": "1K"},
+        {"rank": 47, "name": "openchat-3.5", "provider": "OpenChat", "elo": 1170, "ci": "±5", "votes": "1K"},
+        {"rank": 48, "name": "zephyr-7b", "provider": "HuggingFace", "elo": 1165, "ci": "±5", "votes": "1K"},
+        {"rank": 49, "name": "vicuna-33b", "provider": "LMSYS", "elo": 1160, "ci": "±5", "votes": "1K"},
+        {"rank": 50, "name": "llama-2-70b", "provider": "Meta", "elo": 1155, "ci": "±5", "votes": "1K"},
+    ]
+}
+
+# In-memory leaderboard cache
+leaderboard_data = {}
+
+def load_leaderboard_cache():
+    """Load leaderboard data from cache file or use defaults"""
+    global leaderboard_data
+    try:
+        with open(LEADERBOARD_FILE, "r") as f:
+            leaderboard_data = json.load(f)
+            sync_log(f"📊 Loaded leaderboard cache ({len(leaderboard_data.get('overall', []))} models)", "INFO")
+    except (FileNotFoundError, json.JSONDecodeError):
+        leaderboard_data = DEFAULT_LEADERBOARD.copy()
+        sync_log("📊 Using default leaderboard data", "INFO")
+
+def save_leaderboard_cache():
+    """Save leaderboard data to cache file"""
+    try:
+        with open(LEADERBOARD_FILE, "w") as f:
+            json.dump(leaderboard_data, f, indent=2)
+    except Exception as e:
+        sync_log(f"⚠️ Failed to save leaderboard cache: {e}", "WARN")
+
+async def fetch_leaderboard_with_browser():
+    """Fetch leaderboard data using the global Camoufox browser (handles JS rendering)"""
+    global leaderboard_data, global_page, global_browser
+    
+    await add_log("📊 Fetching leaderboard using browser (JS rendering)...", "INFO")
+    
+    if not global_browser:
+        await add_log("⚠️ Browser not initialized, using cached leaderboard data", "WARN")
+        return False
+    
+    leaderboard_page = None
+    try:
+        # Create a new page in the existing browser context
+        context = global_browser.contexts[0] if global_browser.contexts else await global_browser.new_context()
+        leaderboard_page = await context.new_page()
+        
+        await add_log("🌐 Navigating to LMArena leaderboard...", "DEBUG")
+        await leaderboard_page.goto("https://lmarena.ai/leaderboard/text/overall", wait_until="networkidle", timeout=30000)
+        
+        # Wait for the table to render
+        await asyncio.sleep(3)
+        
+        # Check for Cloudflare challenge
+        title = await leaderboard_page.title()
+        if "Just a moment" in title or "Cloudflare" in title:
+            await add_log("🛡️ Cloudflare challenge on leaderboard, attempting to pass...", "WARN")
+            passed = await handle_cloudflare_challenge(leaderboard_page, "leaderboard", max_wait=20)
+            if not passed:
+                await add_log("❌ Failed to pass Cloudflare on leaderboard", "ERROR")
+                return False
+            await asyncio.sleep(2)
+        
+        # Extract leaderboard data using JavaScript
+        await add_log("📋 Extracting leaderboard data from page...", "DEBUG")
+        models = await leaderboard_page.evaluate(r"""
+            () => {
+                const models = [];
+                
+                // Find all table rows
+                const rows = document.querySelectorAll('table tbody tr');
+                
+                rows.forEach((row, index) => {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length >= 4) {
+                        try {
+                            // Extract all cell text content (cleaned)
+                            const cellTexts = Array.from(cells).map(c => c.textContent.trim());
+                            
+                            let rank = index + 1;
+                            let provider = '';
+                            let name = '';
+                            let elo = '';
+                            let ci = '';
+                            let votes = '';
+                            
+                            // First cell is usually rank
+                            const firstCell = cellTexts[0];
+                            if (/^\d+$/.test(firstCell)) {
+                                rank = parseInt(firstCell);
+                            }
+                            
+                            // Process each cell to identify its type
+                            for (let i = 0; i < cellTexts.length; i++) {
+                                const text = cellTexts[i];
+                                if (!text) continue;
+                                
+                                // Skip rank cell
+                                if (i === 0 && /^\d+$/.test(text)) continue;
+                                
+                                // ELO: 4-digit number starting with 1 (like 1491, 1400, etc)
+                                if (!elo && /^1[3-5]\d{2}$/.test(text)) {
+                                    elo = text;
+                                    continue;
+                                }
+                                
+                                // CI: small number, often just a single or double digit
+                                if (!ci && /^\d{1,2}$/.test(text) && parseInt(text) < 100) {
+                                    ci = '±' + text;
+                                    continue;
+                                }
+                                
+                                // Votes: comma-separated number (like 12,087) or number with K/M
+                                if (!votes && (/^\d{1,3}(,\d{3})+$/.test(text) || /^\d+(\.\d+)?[KkMm]$/.test(text) || /^\d{4,}$/.test(text))) {
+                                    votes = text;
+                                    continue;
+                                }
+                            }
+                            
+                            // Find model name - look for the cell with dashes that looks like a model name
+                            // Usually it's one of the first few cells after rank
+                            for (let i = 1; i < Math.min(cellTexts.length, 5); i++) {
+                                const text = cellTexts[i];
+                                if (text && text.length > 5 && text.includes('-') && 
+                                    !text.includes('±') && 
+                                    !/^\d/.test(text) &&
+                                    !/^[\d\.\,\+\-KkMm\s]+$/.test(text)) {
+                                    name = text;
+                                    break;
+                                }
+                            }
+                            
+                            // If no name found with dash, try any longer text
+                            if (!name) {
+                                for (let i = 1; i < cellTexts.length; i++) {
+                                    const text = cellTexts[i];
+                                    if (text && text.length > 10 && 
+                                        !/^\d/.test(text) &&
+                                        !text.includes('±')) {
+                                        name = text;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            // Find provider from known list
+                            const knownProviders = ['OpenAI', 'Anthropic', 'Google', 'Meta', 'xAI', 'Mistral', 
+                                'DeepSeek', 'Alibaba', 'Cohere', 'Microsoft', 'Nvidia', 'Zhipu', 'Moonshot',
+                                '01.AI', 'HuggingFace', 'Databricks', 'Reka', 'Berkeley', 'LMSYS', 'Tencent',
+                                'Baidu', 'Together', 'Perplexity', 'AI21', 'Amazon', 'Apple'];
+                            
+                            // Check cells for exact provider match
+                            for (let i = 0; i < cellTexts.length; i++) {
+                                const text = cellTexts[i];
+                                for (const p of knownProviders) {
+                                    if (text === p || text.toLowerCase() === p.toLowerCase()) {
+                                        provider = p;
+                                        break;
+                                    }
+                                }
+                                if (provider) break;
+                            }
+                            
+                            // Also check image alt text for provider
+                            if (!provider) {
+                                const imgs = row.querySelectorAll('img');
+                                for (const img of imgs) {
+                                    const alt = (img.alt || img.title || '').toLowerCase();
+                                    for (const p of knownProviders) {
+                                        if (alt.includes(p.toLowerCase())) {
+                                            provider = p;
+                                            break;
+                                        }
+                                    }
+                                    if (provider) break;
+                                }
+                            }
+                            
+                            // Fallback: extract provider from model name if it starts with known prefix
+                            if (!provider && name) {
+                                for (const p of knownProviders) {
+                                    if (name.toLowerCase().startsWith(p.toLowerCase())) {
+                                        provider = p;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (name && rank <= 50) {
+                                models.push({ 
+                                    rank, 
+                                    name, 
+                                    provider: provider || 'Unknown',
+                                    elo: elo || '',
+                                    ci: ci || '',
+                                    votes: votes || ''
+                                });
+                            }
+                        } catch (e) {
+                            // Skip this row on error
+                        }
+                    }
+                });
+                
+                return models;
+            }
+        """)
+        
+        if models and len(models) > 0:
+            # Clean up model names (remove org prefixes if present in name)
+            # Include both with and without spaces, and common variations
+            prefix_patterns = [
+                'Anthropic', 'anthropic',
+                'OpenAI', 'openai', 
+                'Google', 'google',
+                'Meta', 'meta',
+                'xAI', 'xai', 'XAI',
+                'Mistral', 'mistral',
+                'DeepSeek', 'deepseek', 'Deepseek',
+                'Alibaba', 'alibaba',
+                'Cohere', 'cohere',
+                'Microsoft', 'microsoft',
+                'Nvidia', 'nvidia', 'NVIDIA',
+                'Zhipu', 'zhipu',
+                'Moonshot', 'moonshot', 'MoonshotAI', 'moonshotai',
+                '01.AI', '01.ai',
+                'HuggingFace', 'huggingface', 'Huggingface',
+                'Databricks', 'databricks',
+                'Reka', 'reka',
+                'Berkeley', 'berkeley',
+                'LMSYS', 'lmsys',
+                'Tencent', 'tencent',
+                'Baidu', 'baidu',
+                'Together', 'together',
+                'Perplexity', 'perplexity',
+                'AI21', 'ai21',
+                'Amazon', 'amazon', 'AWS', 'aws',
+                'Apple', 'apple',
+                'Qwen Icon', 'Qwen', 'qwen',
+                'Azure', 'azure',
+                'Minimax', 'minimax',
+                'Stepfun', 'stepfun',
+                'InternLM', 'internlm',
+                'OpenChat', 'openchat',
+                'Snowflake', 'snowflake',
+                'AntGroup', 'antgroup',
+                'RWKV', 'rwkv',
+                'Stability', 'stability',
+            ]
+            
+            cleaned = []
+            for m in models:
+                name = m.get('name', '')
+                original_name = name
+                
+                # Try to remove prefix (with or without space after it)
+                for prefix in prefix_patterns:
+                    # Check with space
+                    if name.startswith(prefix + ' '):
+                        name = name[len(prefix) + 1:]
+                        break
+                    # Check without space (concatenated)
+                    elif name.startswith(prefix) and len(name) > len(prefix):
+                        # Make sure we're not cutting a legitimate model name
+                        remainder = name[len(prefix):]
+                        # If remainder starts with lowercase or dash, it's likely concatenated
+                        if remainder and (remainder[0].islower() or remainder[0] in '-_'):
+                            name = remainder
+                            break
+                
+                # Also strip any leading/trailing whitespace
+                name = name.strip()
+                
+                # If name became empty, use original
+                if not name:
+                    name = original_name
+                
+                cleaned.append({
+                    "rank": m["rank"], 
+                    "name": name,
+                    "provider": m.get("provider", "Unknown"),
+                    "elo": m.get("elo", ""),
+                    "ci": m.get("ci", ""),
+                    "votes": m.get("votes", "")
+                })
+            
+            # Deduplicate and sort
+            seen = set()
+            unique = []
+            for m in sorted(cleaned, key=lambda x: x["rank"]):
+                if m["rank"] not in seen and m["name"]:
+                    seen.add(m["rank"])
+                    unique.append(m)
+            
+            if unique:
+                leaderboard_data["overall"] = unique[:50]
+                leaderboard_data["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                save_leaderboard_cache()
+                await add_log(f"✅ Leaderboard updated with {len(unique)} models from browser", "SUCCESS")
+                return True
+        
+        await add_log("⚠️ No models extracted from leaderboard page, keeping cached data", "WARN")
+        return False
+        
+    except Exception as e:
+        await add_log(f"⚠️ Leaderboard browser fetch failed: {e}", "WARN")
+        return False
+    finally:
+        if leaderboard_page:
+            try:
+                await leaderboard_page.close()
+            except:
+                pass
+
+async def update_leaderboard_on_startup():
+    """Fetch fresh leaderboard data from LMArena on server startup"""
+    # Wait a bit for browser to be ready
+    await asyncio.sleep(5)
+    await fetch_leaderboard_with_browser()
+
+@app.get("/api/leaderboard")
+async def get_leaderboard(request: Request, category: str = "overall"):
+    """Return static leaderboard data"""
+    session = await get_current_session(request)
+    if not session:
+        return {"error": "Not authenticated"}
+    
+    # Always return overall for now (simplified)
+    models = leaderboard_data.get("overall", DEFAULT_LEADERBOARD["overall"])
+    last_updated = leaderboard_data.get("last_updated", "Unknown")
+    
+    return {
+        "category": "overall",
+        "models": models,
+        "last_updated": last_updated,
+        "timestamp": int(time.time())
+    }
+
+@app.post("/api/leaderboard/refresh")
+async def refresh_leaderboard(request: Request):
+    """Refresh leaderboard data by fetching from LMArena using browser automation"""
+    session = await get_current_session(request)
+    if not session:
+        return {"error": "Not authenticated", "success": False}
+    
+    try:
+        success = await fetch_leaderboard_with_browser()
+        
+        if success:
+            models = leaderboard_data.get("overall", [])
+            last_updated = leaderboard_data.get("last_updated", "Unknown")
+            return {
+                "success": True,
+                "message": f"Leaderboard refreshed with {len(models)} models",
+                "models": models,
+                "last_updated": last_updated
+            }
+        else:
+            # Return cached data on failure
+            models = leaderboard_data.get("overall", DEFAULT_LEADERBOARD["overall"])
+            last_updated = leaderboard_data.get("last_updated", "Unknown")
+            return {
+                "success": False,
+                "message": "Failed to fetch fresh data, showing cached results",
+                "models": models,
+                "last_updated": last_updated
+            }
+    except Exception as e:
+        await add_log(f"❌ Leaderboard refresh error: {e}", "ERROR")
+        return {
+            "success": False,
+            "message": f"Error: {str(e)}",
+            "models": leaderboard_data.get("overall", DEFAULT_LEADERBOARD["overall"]),
+            "last_updated": leaderboard_data.get("last_updated", "Unknown")
+        }
+
+@app.post("/update-generation-settings")
+async def update_generation_settings(
     request: Request,
-    token_collect_count: int = Form(15),
-    token_collect_delay: int = Form(5)
+    default_temperature: Optional[float] = Form(None),
+    default_top_p: Optional[float] = Form(None),
+    default_max_tokens: Optional[int] = Form(None),
+    default_presence_penalty: Optional[float] = Form(None),
+    default_frequency_penalty: Optional[float] = Form(None)
 ):
-    """Update token collection settings"""
+    """Update generation parameters"""
     session = await get_current_session(request)
     if not session:
         return RedirectResponse(url="/login", status_code=303)
     
     config = get_config()
-    config["token_collect_count"] = max(1, min(token_collect_count, 50))  # Clamp 1-50
-    config["token_collect_delay"] = max(1, min(token_collect_delay, 60))  # Clamp 1-60s
+    
+    # Update generation settings if provided
+    if default_temperature is not None:
+        config["default_temperature"] = max(0.0, min(default_temperature, 2.0))
+    if default_top_p is not None:
+        config["default_top_p"] = max(0.0, min(default_top_p, 1.0))
+    if default_max_tokens is not None:
+        config["default_max_tokens"] = max(1, min(default_max_tokens, 128000))
+    if default_presence_penalty is not None:
+        config["default_presence_penalty"] = max(-2.0, min(default_presence_penalty, 2.0))
+    if default_frequency_penalty is not None:
+        config["default_frequency_penalty"] = max(-2.0, min(default_frequency_penalty, 2.0))
+        
+    save_config(config)
+    
+    return RedirectResponse(url="/dashboard?success=generation_settings_updated", status_code=303)
+
+@app.post("/update-collection-settings")
+async def update_collection_settings(
+    request: Request,
+    token_collect_count: Optional[int] = Form(None),
+    token_collect_delay: Optional[int] = Form(None),
+    chunk_size: Optional[int] = Form(None),
+    chunk_rotation_limit: Optional[int] = Form(None),
+    default_presence_penalty: Optional[float] = Form(None),
+    default_frequency_penalty: Optional[float] = Form(None)
+):
+    """Update system settings (collection & advanced)"""
+    session = await get_current_session(request)
+    if not session:
+        return RedirectResponse(url="/login", status_code=303)
+    
+    config = get_config()
+    
+    # Update collection settings if provided
+    if token_collect_count is not None:
+        config["token_collect_count"] = max(1, min(token_collect_count, 50))
+    if token_collect_delay is not None:
+        config["token_collect_delay"] = max(1, min(token_collect_delay, 60))
+        
+    # Update advanced settings if provided
+    if chunk_size is not None:
+        config["chunk_size"] = max(1000, chunk_size)
+    if chunk_rotation_limit is not None:
+        config["chunk_rotation_limit"] = max(1, chunk_rotation_limit)
+    if default_presence_penalty is not None:
+        config["default_presence_penalty"] = max(-2.0, min(default_presence_penalty, 2.0))
+    if default_frequency_penalty is not None:
+        config["default_frequency_penalty"] = max(-2.0, min(default_frequency_penalty, 2.0))
+        
     save_config(config)
     
     return RedirectResponse(url="/dashboard?success=settings_updated", status_code=303)
+
+@app.post("/update-profile")
+async def update_profile(
+    request: Request,
+    profile_name: Optional[str] = Form(None),
+    profile_avatar: Optional[str] = Form(None)
+):
+    """Update user profile settings"""
+    session = await get_current_session(request)
+    if not session:
+        return RedirectResponse(url="/login", status_code=303)
+    
+    config = get_config()
+    
+    # Update profile name (sanitize and limit length)
+    if profile_name is not None:
+        clean_name = profile_name.strip()[:30]
+        if clean_name:
+            config["profile_name"] = clean_name
+    
+    # Update profile avatar (limit to 2 chars for emoji support)
+    if profile_avatar is not None:
+        clean_avatar = profile_avatar.strip()[:2]
+        if clean_avatar:
+            config["profile_avatar"] = clean_avatar
+    
+    save_config(config)
+    
+    return RedirectResponse(url="/dashboard?success=profile_updated", status_code=303)
 
 # --- OpenAI Compatible API Endpoints ---
 
@@ -2860,241 +5281,6 @@ async def list_models():
             } for model in text_models if model.get("publicName")
         ]
     }
-
-async def refresh_recaptcha_token():
-    global global_page, cached_recaptcha_token, cached_recaptcha_timestamp
-    
-    # --- CACHING OPTIMIZATION ---
-    # Check if we have a valid cached token (not expired)
-    current_time = time.time()
-    if cached_recaptcha_token and (current_time - cached_recaptcha_timestamp) < RECAPTCHA_TOKEN_CACHE_TTL:
-        age = int(current_time - cached_recaptcha_timestamp)
-        print(f"✅ Using cached reCAPTCHA token (age: {age}s / {RECAPTCHA_TOKEN_CACHE_TTL}s TTL)")
-        return cached_recaptcha_token
-    
-    page = global_page
-    if not page:
-        print("❌ No active page found for reCAPTCHA generation")
-        return None
-        
-    print("🕵️ Extracting fresh reCAPTCHA token (cache expired or empty)...")
-    try:
-        # We need to find the site key first. It's usually in the HTML.
-        # Look for 'grecaptcha.execute("SITE_KEY"' or similar
-        # Or just try to execute grecaptcha if it's loaded
-        
-        # 1. Check if grecaptcha is defined (wait for it)
-        is_grecaptcha = False
-        print("   Waiting for grecaptcha to load...")
-        for i in range(20):
-            is_grecaptcha = await page.evaluate("typeof grecaptcha !== 'undefined' || typeof window.grecaptcha !== 'undefined'")
-            if is_grecaptcha:
-                break
-            await asyncio.sleep(1)
-        
-        if is_grecaptcha:
-            print("✅ grecaptcha is defined on the page.")
-            
-            # 2. Try to execute it with a common action
-            # We need the site key. Sometimes it's not needed if we use the 'execute' method on the object directly if it's already initialized?
-            # No, usually grecaptcha.execute('KEY', ...)
-            
-            # Let's try to find the key in the page content
-            content = await page.content()
-            # Common patterns for site key
-            # "sitekey": "..."
-            # grecaptcha.execute("..."
-            
-            site_key_match = re.search(r'grecaptcha\.execute\("([^"]+)"', content)
-            if not site_key_match:
-                site_key_match = re.search(r'sitekey["\']?: ?["\']([^"\']+)["\']', content)
-            
-            site_key = None
-            if site_key_match:
-                site_key = site_key_match.group(1)
-                print(f"✅ Found reCAPTCHA site key via regex: {site_key}")
-
-            # Fallback: Look for the script tag with render=KEY
-            if not site_key:
-                script_src = await page.evaluate("""
-                    () => {
-                        const scripts = Array.from(document.querySelectorAll('script[src*="recaptcha"]'));
-                        return scripts.map(s => s.src).find(s => s.includes('render='));
-                    }
-                """)
-                if script_src:
-                    import urllib.parse
-                    parsed = urllib.parse.urlparse(script_src)
-                    qs = urllib.parse.parse_qs(parsed.query)
-                    if 'render' in qs:
-                        site_key = qs['render'][0]
-                        print(f"✅ Found site key from script src: {site_key}")
-
-            if site_key:
-                # Execute reCAPTCHA
-                # We might need to wait for it to be ready
-                print(f"   Executing reCAPTCHA with key: {site_key}")
-                token = await page.evaluate(f"""
-                    new Promise((resolve, reject) => {{
-                        const g = window.grecaptcha || grecaptcha;
-                        g.ready(() => {{
-                            g.execute('{site_key}', {{action: 'submit'}})
-                                .then(resolve)
-                                .catch(err => {{
-                                    console.error("reCAPTCHA execution error:", err);
-                                    resolve(null);
-                                }});
-                        }});
-                    }})
-                """)
-                
-                if token:
-                    print(f"✅ Generated reCAPTCHA token: {token[:20]}...")
-                    # Update both config AND cache
-                    config = get_config()
-                    config["recaptcha_token"] = token
-                    save_config(config)
-                    # Update cache for fast subsequent requests
-                    cached_recaptcha_token = token
-                    cached_recaptcha_timestamp = time.time()
-                    return token
-                else:
-                    print("⚠️ reCAPTCHA execution returned null/empty token.")
-            else:
-                print("⚠️ Could not find reCAPTCHA site key in page source.")
-        else:
-            print("⚠️ grecaptcha is NOT defined on the page (timed out).")
-            
-            # Try to inject script manually if we found the key in logs previously
-            # Key: 6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I
-            print("   Attempting to extract token via DOM bridge (checking page context)...")
-            try:
-                # Debug: Print all script tags and their nonces
-                print("   Scanning for existing scripts and nonces...")
-                scripts_info = await page.evaluate("""
-                    () => {
-                        return Array.from(document.scripts).map(s => ({
-                            src: s.src,
-                            nonce: s.nonce,
-                            type: s.type
-                        }));
-                    }
-                """)
-                found_nonce = None
-                for s in scripts_info:
-                    if s['nonce']:
-                        print(f"   Found nonce: {s['nonce']} on script {s['src'][:50]}...")
-                        found_nonce = s['nonce']
-                        break
-                
-                if not found_nonce:
-                    print("   ⚠️ No nonce found on existing scripts.")
-
-                # 1. Create a hidden input for the token
-                await page.evaluate("""
-                    () => {
-                        if (!document.getElementById('recaptcha-token-output')) {
-                            const input = document.createElement('input');
-                            input.id = 'recaptcha-token-output';
-                            input.type = 'hidden';
-                            document.body.appendChild(input);
-                            console.log("Created hidden input for token");
-                        }
-                    }
-                """)
-
-                # 2. Inject the reCAPTCHA library script FIRST (with nonce if found)
-                print("   Injecting reCAPTCHA library...")
-                await page.evaluate(f"""
-                    () => {{
-                        const script = document.createElement('script');
-                        script.src = "https://www.google.com/recaptcha/enterprise.js?render=6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I";
-                        script.async = true;
-                        script.defer = true;
-                        if ("{found_nonce or ''}") {{
-                            script.nonce = "{found_nonce or ''}";
-                        }}
-                        document.head.appendChild(script);
-                        console.log("Injected reCAPTCHA library script");
-                    }}
-                """)
-
-                # 3. Inject a checker script that runs in the PAGE context
-                # We use the same nonce for this inline script too
-                print("   Injecting checker script...")
-                await page.evaluate(f"""
-                    () => {{
-                        const script = document.createElement('script');
-                        if ("{found_nonce or ''}") {{
-                            script.nonce = "{found_nonce or ''}";
-                        }}
-                        script.textContent = `
-                            console.log("Token extractor started in page context");
-                            
-                            const checkAndExecute = setInterval(() => {{
-                                const g = window.grecaptcha;
-                                if (g) {{
-                                    console.log("grecaptcha found!", g);
-                                    clearInterval(checkAndExecute);
-                                    
-                                    const execute = () => {{
-                                        const enterprise = g.enterprise || g;
-                                        enterprise.ready(() => {{
-                                            console.log("grecaptcha ready, executing...");
-                                            enterprise.execute('6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I', {{action: 'submit'}})
-                                                .then(token => {{
-                                                    console.log("Token generated!");
-                                                    document.getElementById('recaptcha-token-output').value = token;
-                                                }})
-                                                .catch(err => {{
-                                                    console.error("Execution error:", err);
-                                                    document.getElementById('recaptcha-token-output').value = "ERROR: " + err.toString();
-                                                }});
-                                        }});
-                                    }};
-                                    
-                                    execute();
-                                }}
-                            }}, 1000);
-                            
-                            // Stop after 60 seconds
-                            setTimeout(() => clearInterval(checkAndExecute), 60000);
-                        `;
-                        document.body.appendChild(script);
-                    }}
-                """)
-                
-                # 4. Wait for the token to appear in the input
-                print("   Waiting for token in hidden input...")
-                token = None
-                for _ in range(60): # Wait up to 60 seconds
-                    token = await page.evaluate("document.getElementById('recaptcha-token-output').value")
-                    if token:
-                        break
-                    await asyncio.sleep(1)
-                
-                if token and not token.startswith("ERROR"):
-                    print(f"✅ Generated reCAPTCHA token via DOM bridge: {token[:20]}...")
-                    # Update both config AND cache
-                    config = get_config()
-                    config["recaptcha_token"] = token
-                    save_config(config)
-                    # Update cache for fast subsequent requests
-                    cached_recaptcha_token = token
-                    cached_recaptcha_timestamp = time.time()
-                    return token
-                else:
-                    print(f"❌ Token generation failed (DOM bridge): {token}")
-                    
-            except Exception as e:
-                print(f"   ❌ Injection failed: {e}")
-                # Debug: print all script srcs
-                scripts = await page.evaluate("Array.from(document.scripts).map(s => s.src)")
-                print(f"   Scripts loaded: {[s for s in scripts if 'recaptcha' in s or 'google' in s]}")
-    except Exception as e:
-        print(f"⚠️ Error extracting reCAPTCHA token: {e}")
-    
-    return None
 
 # --- Full-Page Cloudflare Challenge Handler ---
 async def handle_cloudflare_challenge(page, context: str = "unknown", max_wait: int = 30) -> bool:
@@ -3309,6 +5495,15 @@ async def handle_turnstile_modal(page, context: str = "unknown") -> bool:
             for (const dialog of dialogs) {
                 const text = dialog.textContent || '';
                 if (text.includes('Security Verification') || text.includes('Verify you are human')) {
+                    // Look for Turnstile iframe within the dialog to get click coordinates
+                    const iframe = dialog.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+                    if (iframe) {
+                        const rect = iframe.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return { found: true, type: 'security_dialog', x: rect.x + 35, y: rect.y + rect.height / 2 };
+                        }
+                    }
+                    // No iframe found, return without coordinates
                     return { found: true, type: 'security_dialog' };
                 }
             }
@@ -3341,35 +5536,28 @@ async def handle_turnstile_modal(page, context: str = "unknown") -> bool:
     
     await add_log(f"🛡️ [{context}] Turnstile detected (type: {turnstile_present.get('type')})!", "INFO")
     
+    # Brief wait for Turnstile to render
+    await asyncio.sleep(0.5)
+    
     # Try multiple methods to click the Turnstile checkbox
     clicked = False
     
-    for attempt in range(5):  # 5 attempts
+    for attempt in range(3):  # Reduced from 5 to 3 attempts
         if clicked:
             break
-        await add_log(f"🛡️ [{context}] Click attempt {attempt + 1}/5...", "DEBUG")
+        await add_log(f"🛡️ [{context}] Click attempt {attempt + 1}/3...", "DEBUG")
         
-        # Method 1: Click via bounding box from JS evaluation
-        if not clicked and turnstile_present.get('x') and turnstile_present.get('y'):
-            try:
-                x, y = turnstile_present['x'], turnstile_present['y']
-                await page.mouse.move(x, y, steps=5)
-                await asyncio.sleep(0.2)
-                await page.mouse.click(x, y)
-                await add_log(f"✅ [{context}] Clicked at ({int(x)}, {int(y)}) via bounding box!", "SUCCESS")
-                clicked = True
-            except Exception as e:
-                await add_log(f"⚠️ [{context}] Bounding box click failed: {e}", "DEBUG")
-        
-        # Method 2: Re-evaluate to get fresh coordinates
+        # Method 1: Click via bounding box from JS evaluation (refresh coordinates on each attempt)
         if not clicked:
             try:
                 fresh_info = await page.evaluate("""
                     () => {
+                        // Find Turnstile iframe
                         const iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
                         for (const iframe of iframes) {
                             const rect = iframe.getBoundingClientRect();
                             if (rect.width > 0 && rect.height > 0) {
+                                // Click at checkbox position (left side of frame)
                                 return { found: true, x: rect.x + 35, y: rect.y + rect.height / 2 };
                             }
                         }
@@ -3381,10 +5569,22 @@ async def handle_turnstile_modal(page, context: str = "unknown") -> bool:
                     await page.mouse.move(x, y, steps=5)
                     await asyncio.sleep(0.2)
                     await page.mouse.click(x, y)
-                    await add_log(f"✅ [{context}] Clicked at ({int(x)}, {int(y)}) via fresh evaluation!", "SUCCESS")
+                    await add_log(f"✅ [{context}] Clicked at ({int(x)}, {int(y)}) via JS evaluation!", "SUCCESS")
                     clicked = True
             except Exception as e:
-                await add_log(f"⚠️ [{context}] Fresh evaluation click failed: {e}", "DEBUG")
+                await add_log(f"⚠️ [{context}] JS evaluation click failed: {e}", "DEBUG")
+        
+        # Method 2: Use initial coordinates if we have them
+        if not clicked and turnstile_present.get('x') and turnstile_present.get('y'):
+            try:
+                x, y = turnstile_present['x'], turnstile_present['y']
+                await page.mouse.move(x, y, steps=5)
+                await asyncio.sleep(0.2)
+                await page.mouse.click(x, y)
+                await add_log(f"✅ [{context}] Clicked at ({int(x)}, {int(y)}) via initial coords!", "SUCCESS")
+                clicked = True
+            except Exception as e:
+                await add_log(f"⚠️ [{context}] Initial coords click failed: {e}", "DEBUG")
         
         # Method 3: Access Turnstile frame directly
         if not clicked:
@@ -3401,7 +5601,31 @@ async def handle_turnstile_modal(page, context: str = "unknown") -> bool:
                             clicked = True
                             break
                         
-                        # Try clicking body
+                        # Try clicking the label or checkbox container
+                        label = await frame.query_selector('label, .cb-lb, .ctp-checkbox-label')
+                        if label:
+                            await label.click()
+                            await add_log(f"✅ [{context}] Clicked label in frame!", "SUCCESS")
+                            clicked = True
+                            break
+                        
+                        # Get frame element bounding box from parent page
+                        frame_element = await page.query_selector(f'iframe[src*="challenges.cloudflare.com"]')
+                        if frame_element:
+                            frame_box = await frame_element.bounding_box()
+                            if frame_box:
+                                # Click at the checkbox position (left side of frame, vertically centered)
+                                # Turnstile checkbox is typically at x=35 from left edge
+                                click_x = frame_box['x'] + 35
+                                click_y = frame_box['y'] + frame_box['height'] / 2
+                                await page.mouse.move(click_x, click_y, steps=5)
+                                await asyncio.sleep(0.2)
+                                await page.mouse.click(click_x, click_y)
+                                await add_log(f"✅ [{context}] Clicked frame element at ({int(click_x)}, {int(click_y)})!", "SUCCESS")
+                                clicked = True
+                                break
+                        
+                        # Fallback: Try clicking body
                         body = await frame.query_selector('body')
                         if body:
                             box = await body.bounding_box()
@@ -3419,13 +5643,13 @@ async def handle_turnstile_modal(page, context: str = "unknown") -> bool:
             await asyncio.sleep(1)
     
     if not clicked:
-        await add_log(f"⚠️ [{context}] Could not click Turnstile after 5 attempts", "WARN")
+        await add_log(f"⚠️ [{context}] Could not click Turnstile after 3 attempts", "WARN")
         return False
     
-    # Wait for Turnstile verification to complete
+    # Wait for Turnstile verification to complete (reduced to 8s max for speed)
     await add_log(f"⏳ [{context}] Waiting for Turnstile verification...", "DEBUG")
     
-    for wait_attempt in range(15):  # Wait up to 15 seconds
+    for wait_attempt in range(8):  # Wait up to 8 seconds (reduced from 15)
         await asyncio.sleep(1)
         
         # Check if Turnstile is gone
@@ -3456,11 +5680,10 @@ async def handle_turnstile_modal(page, context: str = "unknown") -> bool:
         
         if not still_present:
             await add_log(f"✅ [{context}] Turnstile verification completed!", "SUCCESS")
-            await asyncio.sleep(0.5)  # Brief stabilization
             return True
         
-        if wait_attempt == 14:
-            await add_log(f"⚠️ [{context}] Turnstile still visible after 15s", "WARN")
+        if wait_attempt == 7:
+            await add_log(f"⚠️ [{context}] Turnstile still visible after 8s", "WARN")
     
     return clicked
 
@@ -3617,20 +5840,81 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                 # Clear cookies before navigation to get fresh token
                 await collection_context.clear_cookies()
                 
-                # Navigate to LMArena - using the global browser that already passed Cloudflare
-                await add_log(f"🌐 Navigating to LMArena...", "DEBUG")
+                # Navigate to LMArena - Try arena mode first (simpler, more reliable for auth)
+                # Arena mode triggers auth on first interaction without needing model selection
+                await add_log(f"🌐 Navigating to LMArena Arena mode...", "DEBUG")
                 await collection_page.goto(
-                    "https://lmarena.ai/?mode=direct", 
+                    "https://lmarena.ai/", 
                     wait_until="domcontentloaded",
                     timeout=60000
                 )
                 
-                # Wait for page to load
-                await asyncio.sleep(3)
+                # Wait for page to load and React to hydrate
+                await asyncio.sleep(2)
+                
+                # CRITICAL: Clear localStorage and sessionStorage to ensure Terms dialog appears
+                # If terms acceptance is stored, the dialog won't show!
+                try:
+                    await collection_page.evaluate("""
+                        () => {
+                            localStorage.clear();
+                            sessionStorage.clear();
+                        }
+                    """)
+                    await add_log("🧹 Cleared localStorage/sessionStorage", "DEBUG")
+                    # No reload needed - storage is cleared for this page context
+                except Exception as clear_err:
+                    await add_log(f"⚠️ Storage clear error: {clear_err}", "DEBUG")
                 
                 # Check page state
                 current_title = await collection_page.title()
+                current_url = collection_page.url
                 await add_log(f"📄 Page title: {current_title}", "DEBUG")
+                await add_log(f"📄 Page URL: {current_url}", "DEBUG")
+                
+                # Debug: Log what elements are on the page
+                page_debug = await collection_page.evaluate("""
+                    () => {
+                        const info = {
+                            title: document.title,
+                            url: location.href,
+                            buttons: [],
+                            textareas: [],
+                            dialogs: [],
+                            iframes: []
+                        };
+                        
+                        // Check for buttons
+                        document.querySelectorAll('button').forEach(b => {
+                            if (b.offsetParent !== null) { // visible only
+                                info.buttons.push(b.textContent.trim().substring(0, 50));
+                            }
+                        });
+                        
+                        // Check for textareas
+                        document.querySelectorAll('textarea').forEach(t => {
+                            info.textareas.push({
+                                placeholder: t.placeholder,
+                                visible: t.offsetParent !== null
+                            });
+                        });
+                        
+                        // Check for dialogs
+                        document.querySelectorAll('[role="dialog"]').forEach(d => {
+                            info.dialogs.push(d.textContent.substring(0, 100));
+                        });
+                        
+                        // Check for iframes
+                        document.querySelectorAll('iframe').forEach(f => {
+                            info.iframes.push(f.src.substring(0, 80));
+                        });
+                        
+                        return info;
+                    }
+                """)
+                await add_log(f"🔍 Page debug - Buttons: {page_debug.get('buttons', [])[:5]}", "DEBUG")
+                await add_log(f"🔍 Page debug - Textareas: {page_debug.get('textareas', [])}", "DEBUG")
+                await add_log(f"🔍 Page debug - Dialogs: {len(page_debug.get('dialogs', []))}", "DEBUG")
                 
                 # If still on Cloudflare, use the full-page challenge handler
                 if "Just a moment" in current_title or "Cloudflare" in current_title:
@@ -3665,89 +5949,170 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                     # ============================================================
                     await add_log("🎯 Step 1: Selecting a model...", "DEBUG")
                     
+                    # Brief wait for UI (React hydration)
+                    await asyncio.sleep(1)
+                    
                     model_selected = False
                     try:
-                        # Look for model selector dropdown/button
-                        model_selector_btn = await collection_page.query_selector(
-                            'button[aria-haspopup="listbox"], '
-                            'button:has-text("Select a model"), '
-                            '[data-testid="model-selector"], '
-                            '.model-selector'
-                        )
-                        
-                        if model_selector_btn:
-                            await add_log("📋 Found model selector button, clicking...", "DEBUG")
-                            await model_selector_btn.click(timeout=3000)
-                            await asyncio.sleep(1)
-                            
-                            # Look for a model option to click (pick first available model)
-                            model_option = await collection_page.query_selector(
-                                '[role="option"], '
-                                '[role="listbox"] button, '
-                                '[data-testid*="model-option"], '
-                                '.model-option'
-                            )
-                            
-                            if model_option:
-                                await add_log("✅ Found model option, selecting...", "DEBUG")
-                                await model_option.click(timeout=3000)
-                                model_selected = True
-                                await asyncio.sleep(1)
-                            else:
-                                # Try clicking using JS to find any model in the dropdown
-                                model_selected = await collection_page.evaluate("""
-                                    () => {
-                                        // Look for model options in listbox
-                                        const options = document.querySelectorAll('[role="option"], [role="listbox"] button');
-                                        if (options.length > 0) {
-                                            options[0].click();
-                                            return true;
+                        # COMPREHENSIVE model selection using JavaScript
+                        # This handles various UI layouts LMArena might use
+                        model_selected = await collection_page.evaluate("""
+                            async () => {
+                                // Helper to wait
+                                const wait = (ms) => new Promise(r => setTimeout(r, ms));
+                                
+                                // Method 1: Look for dropdown/combobox button with model-related text
+                                const dropdownSelectors = [
+                                    'button[aria-haspopup="listbox"]',
+                                    'button[aria-haspopup="menu"]',
+                                    'button[role="combobox"]',
+                                    '[data-testid*="model"]',
+                                    '[class*="model-select"]',
+                                    '[class*="ModelSelect"]',
+                                    // Shadcn/Radix UI patterns
+                                    'button[data-state]',
+                                    // MUI patterns
+                                    '[class*="MuiSelect"]',
+                                    // Generic dropdown patterns
+                                    '.select-trigger',
+                                    '.dropdown-trigger'
+                                ];
+                                
+                                for (const selector of dropdownSelectors) {
+                                    const elements = document.querySelectorAll(selector);
+                                    for (const el of elements) {
+                                        const text = el.textContent?.toLowerCase() || '';
+                                        const placeholder = el.getAttribute('placeholder')?.toLowerCase() || '';
+                                        const ariaLabel = el.getAttribute('aria-label')?.toLowerCase() || '';
+                                        
+                                        // Check if this looks like a model selector
+                                        if (text.includes('select') || text.includes('model') || text.includes('choose') ||
+                                            placeholder.includes('model') || ariaLabel.includes('model') ||
+                                            text.includes('gpt') || text.includes('claude') || text.includes('gemini')) {
+                                            console.log('Found model dropdown:', el.textContent);
+                                            el.click();
+                                            await wait(800);
+                                            
+                                            // Now look for options in the opened dropdown
+                                            const optionSelectors = [
+                                                '[role="option"]',
+                                                '[role="menuitem"]',
+                                                '[role="listbox"] > *',
+                                                '[data-radix-collection-item]',
+                                                '.dropdown-item',
+                                                '.select-item',
+                                                '[class*="Option"]',
+                                                '[class*="option"]'
+                                            ];
+                                            
+                                            for (const optSelector of optionSelectors) {
+                                                const options = document.querySelectorAll(optSelector);
+                                                if (options.length > 0) {
+                                                    // Click first available option
+                                                    console.log('Found option to click:', options[0].textContent);
+                                                    options[0].click();
+                                                    return true;
+                                                }
+                                            }
+                                            
+                                            // Fallback: look for any clickable element with model names
+                                            const modelNames = ['gpt', 'claude', 'gemini', 'llama', 'mistral', 'qwen', 'deepseek'];
+                                            const allClickables = document.querySelectorAll('button, [role="option"], [role="menuitem"], div[tabindex], li');
+                                            for (const clickable of allClickables) {
+                                                const cText = clickable.textContent?.toLowerCase() || '';
+                                                if (modelNames.some(m => cText.includes(m))) {
+                                                    console.log('Found model option:', clickable.textContent);
+                                                    clickable.click();
+                                                    return true;
+                                                }
+                                            }
                                         }
-                                        // Try finding by text content
-                                        const buttons = document.querySelectorAll('button');
-                                        for (const btn of buttons) {
-                                            if (btn.textContent.includes('gpt') || 
-                                                btn.textContent.includes('claude') || 
-                                                btn.textContent.includes('gemini') ||
-                                                btn.textContent.includes('llama')) {
-                                                btn.click();
+                                    }
+                                }
+                                
+                                // Method 2: Direct search for any element showing model names (already visible)
+                                const modelNames = ['gpt-4', 'gpt-3.5', 'claude', 'gemini', 'llama', 'mistral'];
+                                const allElements = document.querySelectorAll('button, a, div[role="button"], [class*="model"]');
+                                for (const el of allElements) {
+                                    const text = el.textContent?.toLowerCase() || '';
+                                    if (modelNames.some(m => text.includes(m)) && el.offsetParent !== null) {
+                                        // This element contains a model name and is visible
+                                        console.log('Found visible model element:', el.textContent);
+                                        el.click();
+                                        return true;
+                                    }
+                                }
+                                
+                                // Method 3: Look for "Select a model" text anywhere
+                                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                                while (walker.nextNode()) {
+                                    const node = walker.currentNode;
+                                    if (node.textContent?.toLowerCase().includes('select a model') || 
+                                        node.textContent?.toLowerCase().includes('choose a model')) {
+                                        // Click the parent element
+                                        const parent = node.parentElement;
+                                        if (parent && parent.click) {
+                                            console.log('Clicking "Select a model" parent');
+                                            parent.click();
+                                            await wait(800);
+                                            
+                                            // Look for options
+                                            const options = document.querySelectorAll('[role="option"], [role="menuitem"]');
+                                            if (options.length > 0) {
+                                                options[0].click();
                                                 return true;
                                             }
                                         }
-                                        return false;
                                     }
-                                """)
-                                if model_selected:
-                                    await add_log("✅ Selected model via JS", "DEBUG")
-                                    await asyncio.sleep(1)
-                        else:
-                            # Try alternative: Click directly on model name if visible
-                            await add_log("⚠️ Model selector button not found, trying alternatives...", "DEBUG")
-                            model_selected = await collection_page.evaluate("""
-                                () => {
-                                    // Some pages show model names directly
-                                    const modelLinks = document.querySelectorAll('a[href*="model"], button[data-model]');
-                                    if (modelLinks.length > 0) {
-                                        modelLinks[0].click();
-                                        return true;
-                                    }
-                                    return false;
                                 }
-                            """)
+                                
+                                return false;
+                            }
+                        """)
+                        
+                        if model_selected:
+                            await add_log("✅ Selected model via JS!", "SUCCESS")
+                            await asyncio.sleep(1)
+                        else:
+                            # Fallback: Try Playwright selectors
+                            model_selector_btn = await collection_page.query_selector(
+                                'button[aria-haspopup="listbox"], '
+                                'button:has-text("Select a model"), '
+                                'button:has-text("Choose"), '
+                                '[data-testid="model-selector"], '
+                                '.model-selector'
+                            )
+                            
+                            if model_selector_btn:
+                                await add_log("📋 Found model selector via Playwright, clicking...", "DEBUG")
+                                await model_selector_btn.click(timeout=3000)
+                                await asyncio.sleep(1)
+                                
+                                # Look for a model option
+                                model_option = await collection_page.query_selector(
+                                    '[role="option"], '
+                                    '[role="menuitem"], '
+                                    '[role="listbox"] button'
+                                )
+                                
+                                if model_option:
+                                    await model_option.click(timeout=3000)
+                                    model_selected = True
+                                    await add_log("✅ Selected model option!", "SUCCESS")
+                                    await asyncio.sleep(1)
+                            
                     except Exception as model_err:
                         await add_log(f"⚠️ Model selection error: {model_err}", "DEBUG")
                     
                     if not model_selected:
-                        await add_log("⚠️ Could not select model, proceeding anyway (may fail)", "WARN")
+                        await add_log("⚠️ Could not select model - OK for Arena mode (uses random models)", "DEBUG")
                     else:
                         await add_log("✅ Model selected!", "SUCCESS")
                     
                     # ============================================================
-                    # STEP 2: Wait for reCAPTCHA to be ready
-                    # The page loads Google reCAPTCHA which needs to initialize
+                    # STEP 2: Brief wait for page scripts to initialize
                     # ============================================================
-                    await add_log("🔐 Waiting for reCAPTCHA to initialize...", "DEBUG")
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
                     
                     # ============================================================
                     # STEP 3: Find and interact with the chat textarea
@@ -3929,10 +6294,9 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                                         # Now try to click Agree
                                         terms_dismissed = False
                                         
-                                        # IMPORTANT: Wait for any Turnstile verification to complete
-                                        # The Terms dialog might have an embedded Turnstile that needs to finish
+                                        # Quick check for any Turnstile verification
                                         await add_log("⏳ Waiting for Turnstile to complete (if any)...", "DEBUG")
-                                        for turnstile_wait in range(10):  # Wait up to 10 seconds
+                                        for turnstile_wait in range(5):  # Reduced from 10 to 5 seconds
                                             turnstile_status = await collection_page.evaluate("""
                                                 () => {
                                                     // Check for Turnstile iframes
@@ -3940,20 +6304,9 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                                                     for (const iframe of iframes) {
                                                         const rect = iframe.getBoundingClientRect();
                                                         if (rect.width > 50 && rect.height > 50) {
-                                                            // Turnstile is still visible/active
                                                             return { active: true };
                                                         }
                                                     }
-                                                    
-                                                    // Check for cf-turnstile containers that might be loading
-                                                    const containers = document.querySelectorAll('[class*="cf-turnstile"]');
-                                                    for (const container of containers) {
-                                                        const rect = container.getBoundingClientRect();
-                                                        if (rect.width > 50 && rect.height > 50) {
-                                                            return { active: true };
-                                                        }
-                                                    }
-                                                    
                                                     return { active: false };
                                                 }
                                             """)
@@ -3963,10 +6316,10 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                                                 break
                                             
                                             await asyncio.sleep(1)
-                                            if turnstile_wait == 9:
-                                                await add_log("⚠️ Turnstile still active after 10s, proceeding anyway", "WARN")
+                                            if turnstile_wait == 4:
+                                                await add_log("⚠️ Turnstile still active after 5s, proceeding anyway", "WARN")
                                         
-                                        for attempt in range(5):  # Increased to 5 attempts
+                                        for attempt in range(5):  # 5 attempts
                                             if terms_dismissed:
                                                 break
                                             
@@ -4507,22 +6860,59 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                     # ============================================================
                     # FALLBACK: If no token found yet, try calling sign-up API directly
                     # The auth token is generated by /nextjs-api/sign-up endpoint
+                    # NOTE: This API may require a Turnstile response token to work
                     # ============================================================
                     if not found_auth_token["value"]:
                         await add_log("🔄 No token yet, trying direct API call to sign-up...", "DEBUG")
                         try:
-                            # Call the sign-up API directly using the page context
+                            # First, try to get the Turnstile response token if available
                             signup_result = await collection_page.evaluate("""
                                 async () => {
                                     try {
+                                        // Try to find turnstile response in the page
+                                        let turnstileResponse = null;
+                                        
+                                        // Method 1: Check for turnstile widget response
+                                        const turnstileWidget = document.querySelector('[name="cf-turnstile-response"]');
+                                        if (turnstileWidget && turnstileWidget.value) {
+                                            turnstileResponse = turnstileWidget.value;
+                                        }
+                                        
+                                        // Method 2: Try window.turnstile if available
+                                        if (!turnstileResponse && window.turnstile) {
+                                            const widgets = window.turnstile.getWidgets();
+                                            if (widgets && widgets.length > 0) {
+                                                turnstileResponse = window.turnstile.getResponse(widgets[0]);
+                                            }
+                                        }
+                                        
+                                        // Build request body
+                                        const body = {};
+                                        if (turnstileResponse) {
+                                            body.turnstileResponse = turnstileResponse;
+                                            body['cf-turnstile-response'] = turnstileResponse;
+                                        }
+                                        
                                         const response = await fetch('/nextjs-api/sign-up', {
                                             method: 'POST',
                                             headers: {
                                                 'Content-Type': 'application/json',
                                             },
+                                            body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined,
                                             credentials: 'include'
                                         });
-                                        return { status: response.status, ok: response.ok };
+                                        
+                                        let responseText = '';
+                                        try {
+                                            responseText = await response.text();
+                                        } catch (e) {}
+                                        
+                                        return { 
+                                            status: response.status, 
+                                            ok: response.ok,
+                                            hadTurnstile: !!turnstileResponse,
+                                            response: responseText.substring(0, 200)
+                                        };
                                     } catch (e) {
                                         return { error: e.message };
                                     }
@@ -4545,11 +6935,12 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                     await add_log(f"⚠️ Interaction: {click_err}", "DEBUG")
                 
                 # Brief wait then check for token
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 
-                # Poll for the auth cookie (shorter wait since network response is usually faster)
+                # Poll for the auth cookie (network response is usually fastest)
                 auth_cookie = None
-                max_wait = 20  # Increased wait time since auth might take longer
+                token_collected_via_network = False  # Track if we collected via network response
+                max_wait = 12  # Reduced from 20 - token usually arrives quickly
                 poll_interval = 0.5
                 elapsed = 0
                 
@@ -4564,6 +6955,7 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                             collected_tokens.append(token_value)
                             existing_tokens.add(token_value)
                             token_collection_status["collected"] += 1
+                            token_collected_via_network = True  # Mark as collected
                             
                             # Save to config
                             config = get_config()
@@ -4580,12 +6972,13 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                                 try:
                                     await collection_context.clear_cookies()
                                     await asyncio.sleep(0.5)
-                                    await collection_page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=60000)
+                                    await collection_page.goto("https://lmarena.ai/", wait_until="domcontentloaded", timeout=60000)
                                     await add_log(f"✅ Page reloaded, ready for next collection", "DEBUG")
                                 except Exception as reload_err:
                                     await add_log(f"⚠️ Reload error: {reload_err}", "WARN")
                         else:
                             await add_log(f"⚠️ Token already exists, skipping", "WARN")
+                            token_collected_via_network = True  # Still mark as handled
                         
                         found_auth_token["value"] = None  # Reset for next collection
                         break
@@ -4630,18 +7023,37 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
                             await add_log(f"🔄 Clearing cookies for next token...", "DEBUG")
                             try:
                                 await collection_context.clear_cookies()
-                                await collection_page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=30000)
+                                await collection_page.goto("https://lmarena.ai/", wait_until="domcontentloaded", timeout=30000)
                             except Exception as reload_err:
                                 await add_log(f"⚠️ Reload error: {reload_err}", "WARN")
                     else:
                         await add_log(f"⚠️ Duplicate token found, will retry...", "WARN")
                         i -= 1
-                elif token_collection_status["collected"] > i:
+                elif token_collected_via_network:
                     # Token was already collected via network response, skip this warning
                     pass
                 else:
                     await add_log(f"⚠️ No auth cookie found after {max_wait}s on attempt {i + 1}", "WARN")
                     token_collection_status["errors"].append(f"No cookie on attempt {i + 1}")
+                    
+                    # Log detailed page state for debugging
+                    try:
+                        page_state = await collection_page.evaluate("""
+                            () => ({
+                                url: location.href,
+                                title: document.title,
+                                dialogCount: document.querySelectorAll('[role="dialog"]').length,
+                                iframeCount: document.querySelectorAll('iframe').length,
+                                buttonTexts: Array.from(document.querySelectorAll('button')).slice(0,10).map(b => b.textContent.trim().substring(0,30)),
+                                cookies: document.cookie,
+                                localStorageKeys: Object.keys(localStorage).slice(0,10)
+                            })
+                        """)
+                        await add_log(f"🔍 Page state at failure: URL={page_state.get('url', 'N/A')}", "DEBUG")
+                        await add_log(f"🔍 Dialogs: {page_state.get('dialogCount', 0)}, Iframes: {page_state.get('iframeCount', 0)}", "DEBUG")
+                        await add_log(f"🔍 Buttons: {page_state.get('buttonTexts', [])[:5]}", "DEBUG")
+                    except Exception as state_err:
+                        await add_log(f"⚠️ Could not get page state: {state_err}", "DEBUG")
                     
                     # Take a screenshot for debugging
                     try:
@@ -4708,10 +7120,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
     active_generations += 1
     should_decrement = True
     try:
-        # Generate fresh reCAPTCHA token for this request
-        debug_print("🔄 Generating fresh reCAPTCHA token for this request...")
-        await refresh_recaptcha_token()
-
         # Load config to ensure we have the latest token and it's available for later use
         config = get_config()
 
@@ -4743,17 +7151,23 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         default_temp = config.get("default_temperature", 0.7)
         default_top_p = config.get("default_top_p", 1.0)
         default_max_tokens = config.get("default_max_tokens", 64000)
+        default_pres_pen = config.get("default_presence_penalty", 0.0)
+        default_freq_pen = config.get("default_frequency_penalty", 0.0)
         
         # Frontend (SillyTavern, etc.) can override these by sending them in the request
         temperature = body.get("temperature") if body.get("temperature") is not None else default_temp
         top_p = body.get("top_p") if body.get("top_p") is not None else default_top_p
         max_tokens = body.get("max_tokens") if body.get("max_tokens") is not None else default_max_tokens
+        presence_penalty = body.get("presence_penalty") if body.get("presence_penalty") is not None else default_pres_pen
+        frequency_penalty = body.get("frequency_penalty") if body.get("frequency_penalty") is not None else default_freq_pen
         
         # Build generation_params dict (will be added to payload later)
         generation_params = {
             "temperature": temperature,
             "top_p": top_p,
-            "max_new_tokens": max_tokens
+            "max_new_tokens": max_tokens,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty
         }
         debug_print(f"⚙️ Generation params: {generation_params}")
         
@@ -4820,7 +7234,21 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
 
         # Log usage
         try:
-            model_usage_stats[model_public_name] += 1
+            # Initialize if missing (for migration safety)
+            if model_public_name not in model_usage_stats:
+                model_usage_stats[model_public_name] = {"count": 0, "tokens": 0, "last_used": 0}
+            elif isinstance(model_usage_stats[model_public_name], int):
+                # Auto-migrate on the fly if we hit an old int
+                model_usage_stats[model_public_name] = {"count": model_usage_stats[model_public_name], "tokens": 0, "last_used": 0}
+            
+            # Update stats
+            model_usage_stats[model_public_name]["count"] += 1
+            model_usage_stats[model_public_name]["last_used"] = int(time.time())
+            # Estimate tokens (chars / 4 is a rough approximation for prompt)
+            # We'll add response tokens later if possible, but for now prompt tokens is better than nothing
+            estimated_prompt_tokens = len(json.dumps(messages)) // 4
+            model_usage_stats[model_public_name]["tokens"] += estimated_prompt_tokens
+            
             # Save stats immediately after incrementing
             config = get_config()
             config["usage_stats"] = dict(model_usage_stats)
@@ -4920,11 +7348,16 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # but the root "id" of the payload must be unique for every request.
         
         # Chunking Logic
+        # Use config values for chunking
+        config = get_config()
+        chunk_size = config.get("chunk_size", 110000)
+        chunk_rotation_limit = config.get("chunk_rotation_limit", 5)
+        
         chunks = []
-        if len(prompt) > CHUNK_SIZE:
-            debug_print(f"✂️ Prompt length {len(prompt)} > {CHUNK_SIZE}. Splitting into chunks...")
-            for i in range(0, len(prompt), CHUNK_SIZE):
-                chunks.append(prompt[i:i+CHUNK_SIZE])
+        if len(prompt) > chunk_size:
+            debug_print(f"✂️ Prompt length {len(prompt)} > {chunk_size}. Splitting into chunks...")
+            for i in range(0, len(prompt), chunk_size):
+                chunks.append(prompt[i:i+chunk_size])
             debug_print(f"🧩 Split into {len(chunks)} chunks")
         else:
             chunks.append(prompt)
@@ -5044,7 +7477,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     for i, chunk in enumerate(chunks):
                         # --- ROTATION LOGIC ---
                         is_new_session = False
-                        if i % CHUNK_ROTATION_LIMIT == 0:
+                        if i % chunk_rotation_limit == 0:
                             debug_print(f"🔄 Batch Rotation: Switching to New Token & Session for Chunk {i+1}")
                             
                             # --- STICKY SESSION LOGIC ---
@@ -5245,10 +7678,19 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             enc = tiktoken.get_encoding("cl100k_base")
                                             stream_tokens = len(enc.encode(current_response_text))
                                             total_tokens_generated += stream_tokens
+                                            # Update per-model token count
+                                            if model_public_name in model_usage_stats:
+                                                model_usage_stats[model_public_name]["tokens"] += stream_tokens
+                                            # Add to activity log
+                                            add_activity(model_public_name, stream_tokens, "success")
                                             debug_print(f"✅ Stream complete | Tokens: {stream_tokens}")
                                         except Exception:
-                                            total_tokens_generated += len(current_response_text) // 4
-                                            debug_print(f"✅ Stream complete | Tokens: ~{len(current_response_text) // 4}")
+                                            est_tokens = len(current_response_text) // 4
+                                            total_tokens_generated += est_tokens
+                                            if model_public_name in model_usage_stats:
+                                                model_usage_stats[model_public_name]["tokens"] += est_tokens
+                                            add_activity(model_public_name, est_tokens, "success")
+                                            debug_print(f"✅ Stream complete | Tokens: ~{est_tokens}")
                                                 
                                         yield "data: [DONE]\n\n"
                                         debug_print(f"✅ Stream completed")
@@ -5511,12 +7953,20 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 prompt_tokens = len(enc.encode(prompt))
                                 completion_tokens = len(enc.encode(current_response_text))
                                 total_tokens_generated += completion_tokens
+                                # Update per-model token count
+                                if model_public_name in model_usage_stats:
+                                    model_usage_stats[model_public_name]["tokens"] += completion_tokens
+                                # Add to activity log
+                                add_activity(model_public_name, completion_tokens, "success")
                                 debug_print(f"✅ Response complete | Prompt: {prompt_tokens} | Completion: {completion_tokens}")
                             except Exception:
                                 # Fallback to character-based estimation
                                 prompt_tokens = len(prompt) // 4
                                 completion_tokens = len(current_response_text) // 4
                                 total_tokens_generated += completion_tokens
+                                if model_public_name in model_usage_stats:
+                                    model_usage_stats[model_public_name]["tokens"] += completion_tokens
+                                add_activity(model_public_name, completion_tokens, "success")
                                 debug_print(f"✅ Response complete | Prompt: ~{prompt_tokens} | Completion: ~{completion_tokens}")
 
                             final_response = {
