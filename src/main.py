@@ -12,7 +12,6 @@ from http.cookies import SimpleCookie
 from collections import defaultdict
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timezone, timedelta
-
 from platformdirs import user_data_dir
 import uvicorn
 from camoufox.async_api import AsyncCamoufox
@@ -46,7 +45,167 @@ CHUNK_ROTATION_LIMIT = 5
 # Set to True to reuse the same LMArena session ID for the same API Key + Model.
 # This mimics "Direct Chat" behavior and can help bypass "New Session" rate limits (422/429).
 STICKY_SESSIONS = True
+
+# FAKE HISTORY MODE (Recommended!)
+# When True: All chunks are bundled into a SINGLE request as fake chat history.
+#   - Chunk 1 becomes a "user" message in history with a fake "assistant" acknowledgment
+#   - Chunk 2 becomes another "user" message in history with a fake "assistant" acknowledgment  
+#   - Only the LAST chunk is sent as the actual new message
+#   - This avoids multiple API calls and rate limits entirely!
+# When False: Uses the old sequential chunk sending (triggers rate limits on large prompts)
+FAKE_HISTORY_MODE = True
 # ============================================================
+
+async def refresh_recaptcha_token():
+    """Safer reCAPTCHA refresher:
+    - If the current page contains Cloudflare Turnstile, do NOT attempt to inject grecaptcha.
+      Instead return None (Turnstile is handled separately and we rely on cookies/__cf_bm).
+    - If grecaptcha is actually present on the page, attempt a short, guarded execute and cache result.
+    """
+    global global_page, cached_recaptcha_token, cached_recaptcha_timestamp
+
+    # Use the same TTL logic if we already have a genuine cached token
+    current_time = time.time()
+    try:
+        ttl = RECAPTCHA_TOKEN_CACHE_TTL
+    except Exception:
+        ttl = 100
+    if cached_recaptcha_token and (current_time - cached_recaptcha_timestamp) < ttl:
+        age = int(current_time - cached_recaptcha_timestamp)
+        print(f"✅ Using cached reCAPTCHA token (age: {age}s / {ttl}s TTL)")
+        return cached_recaptcha_token
+
+    page = global_page
+    if not page:
+        print("❌ No active page found for reCAPTCHA generation")
+        return None
+
+    # Quick checks in page to decide which challenge is present
+    try:
+        # 1) If Turnstile iframe present -> DO NOT attempt grecaptcha injection
+        has_turnstile = await page.evaluate("""
+            () => !!Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]')).find(i => {
+                const r = i.getBoundingClientRect(); return r.width > 20 && r.height > 20;
+            })
+        """)
+        if has_turnstile:
+            print("ℹ️ Cloudflare Turnstile detected on page — skipping grecaptcha extraction.")
+            # Ensure cookies (cf_clearance / __cf_bm) are captured by saving page context cookies
+            try:
+                cookies = await page.context.cookies()
+                if cookies:
+                    config = get_config()
+                    cookie_parts = [f"{c['name']}={c['value']}" for c in cookies]
+                    config['cookie_string'] = '; '.join(cookie_parts)
+                    # update cf_clearance if present
+                    cf = next((c['value'] for c in cookies if c.get('name')=='cf_clearance'), '')
+                    if cf:
+                        config['cf_clearance'] = cf
+                    ua = await page.evaluate("navigator.userAgent")
+                    config['user_agent'] = ua
+                    save_config(config)
+                    print(f"✅ Saved cookies after Turnstile (cookies: {len(cookies)})")
+            except Exception as e:
+                print(f"⚠️ Failed saving cookies after Turnstile: {e}")
+            # Turnstile flow does not return a grecaptcha token
+            return None
+
+        # 2) If grecaptcha is defined, attempt a short execute
+        is_grecaptcha = await page.evaluate("typeof grecaptcha !== 'undefined' || typeof window.grecaptcha !== 'undefined'")
+        if not is_grecaptcha:
+            # Don't try to inject a grecaptcha library anymore — it's fragile and likely incorrect here.
+            print("⚠️ grecaptcha not found on page. Skipping injection (Turnstile likely used).")
+            return None
+
+        print("✅ grecaptcha detected — attempting to locate site key and execute (short timeout).")
+
+        # Try to find site key in page (script/render or inline)
+        content = await page.content()
+        site_key = None
+
+        import re as _re
+        mm = _re.search(r'grecaptcha\.execute\(["\']([^"\']+)["\']', content)
+        if not mm:
+            mm = _re.search(r'sitekey["\']?\s*[:=]\s*["\']([^"\']+)["\']', content)
+        if not mm:
+            # Fallback: Check for data-sitekey attribute in HTML tags
+            mm = _re.search(r'data-sitekey=["\']([^"\']+)["\']', content)
+        
+        if mm:
+            site_key = mm.group(1)
+            print(f"✅ Found reCAPTCHA site key via regex: {site_key}")
+
+        if not site_key:
+            # try to detect from script tags with render=
+            script_src = await page.evaluate('''() => {
+                const s = Array.from(document.querySelectorAll('script[src*="recaptcha"]')).map(x=>x.src);
+                return s.find(u => u && u.includes('render='));
+            }''')
+            if script_src:
+                try:
+                    import urllib.parse as _up
+                    parsed = _up.urlparse(script_src)
+                    qs = _up.parse_qs(parsed.query)
+                    if 'render' in qs:
+                        site_key = qs['render'][0]
+                        print(f"✅ Found site key from script src: {site_key}")
+                except Exception:
+                    pass
+
+        if not site_key:
+            print("⚠️ Could not find a reCAPTCHA site key — aborting grecaptcha execute.")
+            return None
+
+        # Execute grecaptcha with a short guarded promise (will return None on failure)
+        try:
+            token = await page.evaluate(f"""
+                new Promise((resolve) => {{
+                    try {{
+                        const g = window.grecaptcha || grecaptcha;
+                        if (!g) return resolve(null);
+                        g.ready(() => {{
+                            g.execute('{site_key}', {{action: 'submit'}})
+                              .then(t => resolve(t))
+                              .catch(_ => resolve(null));
+                        }});
+                    }} catch (e) {{ resolve(null); }}
+                }})
+            """, timeout=20000)
+        except Exception as e:
+            print(f"⚠️ grecaptcha execute failed: {e}")
+            token = None
+
+        if token:
+            print(f"✅ Generated reCAPTCHA token (trim): {token[:20]}...")
+            try:
+                config = get_config()
+                config['recaptcha_token'] = token
+                save_config(config)
+            except Exception:
+                pass
+            cached_recaptcha_token = token
+            cached_recaptcha_timestamp = time.time()
+            return token
+        else:
+            print("⚠️ grecaptcha execute returned no token.")
+            return None
+
+    except Exception as e:
+        print(f"❌ Exception in refresh_recaptcha_token: {e}")
+        return None
+
+# --- OPTIMIZATION: Fast JSON Serialization ---
+try:
+    import orjson
+    # orjson returns bytes, so we decode to str for f-string compatibility
+    def fast_json_dumps(data):
+        return orjson.dumps(data).decode('utf-8')
+    print("⚡ Using orjson for high-performance serialization")
+except ImportError:
+    import json
+    def fast_json_dumps(data):
+        return json.dumps(data)
+    print("⚠️ orjson not found, falling back to standard json (slower)")
 
 def debug_print(*args, **kwargs):
     """Print debug messages only if DEBUG is True"""
@@ -323,6 +482,11 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+# --- Custom Exceptions ---
+class UpstreamRateLimitError(Exception):
+    """Raised when upstream provider (Google, OpenAI, etc.) returns a rate limit error in stream"""
+    pass
+
 # --- Constants & Global State ---
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -409,7 +573,13 @@ def sync_log(message: str, level: str = "INFO"):
 
 # --- Helper Functions ---
 
-def get_config():
+_config_cache = None
+
+def get_config(force_reload=False):
+    global _config_cache
+    if _config_cache is not None and not force_reload:
+        return _config_cache
+
     try:
         with open(CONFIG_FILE, "r") as f:
             config = json.load(f)
@@ -440,12 +610,13 @@ def get_config():
     config.setdefault("token_collect_count", 15)
     config.setdefault("token_collect_delay", 2)  # seconds between collections
     
+    _config_cache = config
     return config
 
 def load_usage_stats():
     """Load usage stats from config into memory"""
     global model_usage_stats
-    config = get_config()
+    config = get_config(force_reload=True) # Force load on startup
     raw_stats = config.get("usage_stats", {})
     
     # Migration: Convert old int stats to new dict stats
@@ -460,10 +631,16 @@ def load_usage_stats():
     model_usage_stats = migrated_stats
 
 def save_config(config):
+    global _config_cache
     # Persist in-memory stats to the config dict before saving
     config["usage_stats"] = dict(model_usage_stats)
+    
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
+    
+    # Update the cache with a copy of the saved config
+    _config_cache = config.copy()
+    debug_print(f"✅ Config saved and cache updated")
 
 def get_models():
     try:
@@ -501,11 +678,11 @@ def get_request_headers():
         raise HTTPException(status_code=500, detail="No arena auth tokens configured.")
     
     # Round-robin token selection - save index BEFORE incrementing for correct display
-    token_index_used = current_token_index % len(auth_tokens)
+    token_index_used = random.choice(range(len(auth_tokens)))
     token = auth_tokens[token_index_used]
-    current_token_index = (current_token_index + 1) % len(auth_tokens)
+    current_token_index = token_index_used + 1
 
-    sync_log(f"🔑 Using Token #{token_index_used + 1}/{len(auth_tokens)}", "DEBUG")
+    sync_log(f"🔑 Using Token #{token_index_used + 1}/{len(auth_tokens)}")
     
     # Use captured User-Agent or fallback
     user_agent = config.get("user_agent")
@@ -982,16 +1159,12 @@ async def startup_event():
     save_models(get_models())
     # Load usage stats from config
     load_usage_stats()
-    # Load leaderboard cache
-    load_leaderboard_cache()
     # Log startup
     await add_log("🚀 LMArena Bridge starting up...", "INFO")
     await add_log(f"📍 Dashboard: http://localhost:{PORT}/dashboard", "INFO")
     await add_log(f"📚 API Base URL: http://localhost:{PORT}/v1", "INFO")
     # Start initial data fetch
     asyncio.create_task(get_initial_data())
-    # Update leaderboard in background
-    asyncio.create_task(update_leaderboard_on_startup())
     # Start periodic refresh task (every 30 minutes)
     asyncio.create_task(periodic_refresh_task())
     await add_log("✅ Startup complete", "SUCCESS")
@@ -1464,10 +1637,12 @@ async def dashboard(session: str = Depends(get_current_session)):
     config = get_config()
     models = get_models()
 
-    # Render API Keys
+    # Render API Keys (Desktop Table)
     keys_html = ""
+    keys_mobile_html = ""
     for key in config["api_keys"]:
         created_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(key.get('created', 0)))
+        # Desktop table row
         keys_html += f"""
             <tr>
                 <td><strong>{key['name']}</strong></td>
@@ -1483,6 +1658,29 @@ async def dashboard(session: str = Depends(get_current_session)):
                 </td>
             </tr>
         """
+        # Mobile card
+        keys_mobile_html += f"""
+            <div class="key-card" style="background: var(--bg-dark); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 12px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                    <strong style="font-size: 15px; color: var(--text);">{key['name']}</strong>
+                    <form action='/delete-key' method='post' style='margin:0;' onsubmit='return confirm("Delete this API key?");'>
+                        <input type='hidden' name='key_id' value='{key['key']}'>
+                        <button type='submit' class='btn btn-danger' style='padding: 6px 10px; font-size: 12px;'>🗑️</button>
+                    </form>
+                </div>
+                <div style="background: var(--bg-darker); border-radius: 8px; padding: 10px; margin-bottom: 12px; overflow-x: auto;">
+                    <code style="font-size: 11px; color: var(--primary); word-break: break-all;">{key['key']}</code>
+                </div>
+                <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                    <span class="badge">{key.get('rpm', 60)} RPM</span>
+                    <span class="badge">{key.get('rpd', 'Unlimited')} RPD</span>
+                    <span class="badge" style="background: var(--bg-darker); color: var(--text-muted);">📅 {created_date}</span>
+                </div>
+            </div>
+        """
+    
+    if not keys_mobile_html:
+        keys_mobile_html = '<div style="text-align: center; padding: 30px 20px; color: var(--text-muted);"><p>No API keys yet. Create one below!</p></div>'
 
     # Render Auth Tokens
     auth_tokens = config.get("auth_tokens", [])
@@ -2838,6 +3036,14 @@ async def dashboard(session: str = Depends(get_current_session)):
             padding: 10px;
         }}
 
+        /* Responsive visibility helpers */
+        .desktop-only {{
+            display: block;
+        }}
+        .mobile-only {{
+            display: none !important;
+        }}
+
         /* Responsive Design */
         @media (max-width: 1200px) {{
             .grid-4 {{
@@ -2852,6 +3058,14 @@ async def dashboard(session: str = Depends(get_current_session)):
         }}
 
         @media (max-width: 768px) {{
+            /* Show/hide for mobile */
+            .desktop-only {{
+                display: none !important;
+            }}
+            .mobile-only {{
+                display: block !important;
+            }}
+            
             /* Disable hover effects on touch devices */
             * {{
                 -webkit-tap-highlight-color: transparent;
@@ -3135,6 +3349,11 @@ async def dashboard(session: str = Depends(get_current_session)):
             .btn-danger, .btn-primary, .btn-secondary {{
                 min-height: 48px;
                 padding: 12px 16px;
+            }}
+            
+            /* Create API Key form mobile */
+            .create-key-form > div {{
+                grid-template-columns: 1fr !important;
             }}
             
             /* Fix clickable areas */
@@ -3524,7 +3743,9 @@ async def dashboard(session: str = Depends(get_current_session)):
                     <div class="section-header">
                         <h3>🔑 API Key Management</h3>
                     </div>
-                    <div class="table-container">
+                    
+                    <!-- Existing Keys Table (Desktop) -->
+                    <div class="table-container desktop-only">
                         <table>
                             <thead>
                                 <tr>
@@ -3541,14 +3762,32 @@ async def dashboard(session: str = Depends(get_current_session)):
                             </tbody>
                         </table>
                     </div>
+                    
+                    <!-- Existing Keys Cards (Mobile) -->
+                    <div class="mobile-only" style="display: none;">
+                        {keys_mobile_html}
+                    </div>
+                    
+                    <!-- Create New API Key Form -->
                     <div style="margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--border);">
-                        <form action="/add-key" method="post" style="display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;">
-                            <div class="form-group" style="flex: 1; min-width: 250px; margin-bottom: 0;">
-                                <label class="form-label">New API Key</label>
-                                <input type="text" name="key" class="form-input" placeholder="sk-..." required>
+                        <h4 style="margin-bottom: 16px; font-size: 15px; font-weight: 600; color: var(--text);">➕ Create New API Key</h4>
+                        <form action="/create-key" method="post" class="create-key-form">
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px;">
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label class="form-label">Key Name</label>
+                                    <input type="text" name="name" class="form-input" placeholder="My API Key" required>
+                                </div>
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label class="form-label">RPM (Requests/Min)</label>
+                                    <input type="number" name="rpm" class="form-input" value="60" min="1" max="1000" required>
+                                </div>
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label class="form-label">RPD (Requests/Day)</label>
+                                    <input type="number" name="rpd" class="form-input" value="10000" min="1" required>
+                                </div>
                             </div>
-                            <button type="submit" class="btn btn-primary" style="height: fit-content;">
-                                <span>➕</span> Add Key
+                            <button type="submit" class="btn btn-primary" style="width: 100%;">
+                                <span>🔑</span> Generate API Key
                             </button>
                         </form>
                     </div>
@@ -3770,11 +4009,11 @@ They will be added to existing tokens.">{auth_tokens_str}</textarea>
                             </div>
                             <div class="system-info-row">
                                 <span class="system-info-label">Chunk Size</span>
-                                <span class="system-info-value">{CHUNK_SIZE:,}</span>
+                                <span class="system-info-value">{chunk_size:,}</span>
                             </div>
                             <div class="system-info-row">
                                 <span class="system-info-label">Rotation Limit</span>
-                                <span class="system-info-value">{CHUNK_ROTATION_LIMIT}</span>
+                                <span class="system-info-value">{chunk_rotation_limit}</span>
                             </div>
                             <div class="system-info-row">
                                 <span class="system-info-label">Sticky Sessions</span>
@@ -5178,19 +5417,24 @@ async def update_collection_settings(
     if not session:
         return RedirectResponse(url="/login", status_code=303)
     
-    config = get_config()
+    # Force reload to get fresh config from disk
+    config = get_config(force_reload=True)
     
     # Update collection settings if provided
     if token_collect_count is not None:
         config["token_collect_count"] = max(1, min(token_collect_count, 50))
+        debug_print(f"⚙️ Updated token_collect_count: {config['token_collect_count']}")
     if token_collect_delay is not None:
         config["token_collect_delay"] = max(1, min(token_collect_delay, 60))
+        debug_print(f"⚙️ Updated token_collect_delay: {config['token_collect_delay']}")
         
     # Update advanced settings if provided
     if chunk_size is not None:
         config["chunk_size"] = max(1000, chunk_size)
+        debug_print(f"⚙️ Updated chunk_size: {config['chunk_size']:,}")
     if chunk_rotation_limit is not None:
         config["chunk_rotation_limit"] = max(1, chunk_rotation_limit)
+        debug_print(f"⚙️ Updated chunk_rotation_limit: {config['chunk_rotation_limit']}")
     if default_presence_penalty is not None:
         config["default_presence_penalty"] = max(-2.0, min(default_presence_penalty, 2.0))
     if default_frequency_penalty is not None:
@@ -7107,7 +7351,7 @@ async def auto_collect_auth_tokens(count: int = 15, delay: int = 5):
 
 @app.post("/v1/chat/completions")
 async def api_chat_completions(request: Request, api_key: dict = Depends(rate_limit_api_key)):
-    global active_generations
+    global active_generations, total_tokens_generated
     
     # Block requests during token collection to avoid race conditions
     if token_collection_status["running"]:
@@ -7120,6 +7364,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
     active_generations += 1
     should_decrement = True
     try:
+        # Generate fresh reCAPTCHA token for this request
+        debug_print("🔄 Generating fresh reCAPTCHA token for this request...")
+        await refresh_recaptcha_token()
+
         # Load config to ensure we have the latest token and it's available for later use
         config = get_config()
 
@@ -7368,6 +7616,99 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Local history for this multi-turn request
         local_messages = []
 
+        def build_fake_history_payload(all_chunks, session_id):
+            """
+            Build a single payload with all chunks bundled as fake chat history.
+            Only the LAST chunk becomes the actual userMessage.
+            All previous chunks become fake user/assistant pairs in history.
+            """
+            fake_history = []
+            parent_ids = []
+            
+            # Process all chunks EXCEPT the last one as fake history
+            for idx, chunk_content in enumerate(all_chunks[:-1]):
+                # Generate IDs for this fake turn
+                fake_user_id = str(uuid7())
+                fake_assistant_id = str(uuid7())
+                
+                # Add chunk number indicator
+                chunk_label = f"[CONTEXT PART {idx + 1}/{len(all_chunks)}]\n\n"
+                
+                # Fake user message (the chunk content)
+                fake_user_msg = {
+                    "id": fake_user_id,
+                    "role": "user",
+                    "content": chunk_label + chunk_content,
+                    "experimental_attachments": [],
+                    "parentMessageIds": parent_ids.copy(),
+                    "participantPosition": "a",
+                    "modelId": None,
+                    "evaluationSessionId": session_id,
+                    "status": "success",
+                    "failureReason": None
+                }
+                fake_history.append(fake_user_msg)
+                
+                # Fake assistant acknowledgment
+                fake_assistant_msg = {
+                    "id": fake_assistant_id,
+                    "role": "assistant",
+                    "content": ".",  # Simple acknowledgment
+                    "experimental_attachments": [],
+                    "parentMessageIds": [fake_user_id],
+                    "participantPosition": "a",
+                    "modelId": model_id,
+                    "evaluationSessionId": session_id,
+                    "status": "success",
+                    "failureReason": None
+                }
+                fake_history.append(fake_assistant_msg)
+                
+                # Update parent for next iteration
+                parent_ids = [fake_assistant_id]
+            
+            # Now build the ACTUAL payload with the LAST chunk
+            last_chunk = all_chunks[-1]
+            payload_id = str(uuid7())
+            user_msg_id = str(uuid7())
+            model_msg_id = str(uuid7())
+            
+            # Add instruction to the last chunk if we had multiple chunks
+            if len(all_chunks) > 1:
+                final_content = f"[FINAL PART {len(all_chunks)}/{len(all_chunks)} - You now have all the context. Please respond to the user's request.]\n\n" + last_chunk
+            else:
+                final_content = last_chunk
+            
+            payload = {
+                "id": payload_id,
+                "mode": "direct",
+                "modelAId": model_id,
+                "userMessageId": user_msg_id,
+                "modelAMessageId": model_msg_id,
+                "userMessage": {
+                    "content": final_content,
+                    "experimental_attachments": experimental_attachments,
+                    "parentMessageIds": parent_ids,
+                },
+                "modality": "chat",
+                "parameters": generation_params,
+                "recaptchaV3Token": "03AFcWeA..."
+            }
+            
+            # Inject real reCAPTCHA token if available
+            config = get_config()
+            if config.get("recaptcha_token"):
+                payload["recaptchaV3Token"] = config.get("recaptcha_token")
+            
+            # Add fake history to payload
+            if fake_history:
+                payload["messages"] = fake_history
+            
+            debug_print(f"📦 Built FAKE HISTORY payload: {len(all_chunks)-1} history pairs + 1 final message")
+            debug_print(f"📊 Total fake history messages: {len(fake_history)}")
+            
+            return payload
+
         async def get_chunk_payload(chunk_index, chunk_content, is_last, session_id, is_new_session):
             # Prepare content with warnings if needed
             final_content = chunk_content
@@ -7461,6 +7802,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Handle streaming mode
         if stream:
             async def generate_stream():
+                global total_tokens_generated  # Declare at top of function
                 try:
                     debug_print("🌊 generate_stream started")
                     chunk_id = f"chatcmpl-{uuid.uuid4()}"
@@ -7474,6 +7816,215 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     impersonate_target = "firefox133"
                     debug_print(f"🎭 Impersonating: {impersonate_target}")
                     
+                    # ============================================================
+                    # FAKE HISTORY MODE - Send all chunks in ONE request!
+                    # ============================================================
+                    if FAKE_HISTORY_MODE and total_chunks > 1:
+                        debug_print(f"📜 FAKE HISTORY MODE: Bundling {total_chunks} chunks into single request")
+                        
+                        # Get headers and session
+                        sticky_key = f"{api_key_str}:{model_public_name}"
+                        if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                            data = sticky_session_ids[sticky_key]
+                            current_session_id = data["session_id"]
+                            current_headers = data["headers"]
+                            debug_print(f"📎 Reusing Sticky Session ID: {current_session_id}")
+                        else:
+                            current_headers = get_request_headers()
+                            current_session_id = str(uuid7())
+                            if STICKY_SESSIONS:
+                                sticky_session_ids[sticky_key] = {
+                                    "session_id": current_session_id,
+                                    "headers": current_headers
+                                }
+                            debug_print(f"📎 Created New Session ID: {current_session_id}")
+                        
+                        # Small thinking delay
+                        think_delay = random.uniform(0.5, 1.5)
+                        debug_print(f"🤔 Thinking delay: {think_delay:.2f}s")
+                        await asyncio.sleep(think_delay)
+                        
+                        # Build the fake history payload
+                        payload = build_fake_history_payload(chunks, current_session_id)
+                        
+                        # Prepare headers
+                        chunk_headers = {
+                            "Cookie": current_headers.get("Cookie"),
+                            "Content-Type": current_headers.get("Content-Type"),
+                            "Referer": current_headers.get("Referer"),
+                            "Origin": current_headers.get("Origin"),
+                        }
+                        chunk_headers = {k: v for k, v in chunk_headers.items() if v is not None}
+                        
+                        # Log token info
+                        token_match = re.search(r'arena-auth-prod-v1=([^;]+)', chunk_headers.get("Cookie", ""))
+                        token_display = "Unknown"
+                        if token_match:
+                            current_token = token_match.group(1)
+                            try:
+                                _tokens = get_config().get("auth_tokens", [])
+                                if current_token in _tokens:
+                                    token_display = f"#{_tokens.index(current_token) + 1}"
+                            except: pass
+                        
+                        debug_print(f"📋 SINGLE REQUEST | Token {token_display} | Session: {current_session_id}")
+                        
+                        current_response_text = ""
+                        
+                        # Retry loop for the single request
+                        for attempt in range(5):
+                            try:
+                                async with AsyncSession(impersonate=impersonate_target) as client:
+                                    response = await client.post(url, json=payload, headers=chunk_headers, timeout=180, stream=True)
+                                    
+                                    if response.status_code in [429, 401, 403, 400]:
+                                        error_type = "Rate Limit" if response.status_code == 429 else "Auth/Bad Request Error"
+                                        debug_print(f"⚠️ {response.status_code} ({error_type})")
+                                        
+                                        if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                            del sticky_session_ids[sticky_key]
+                                        
+                                        if attempt < 4:
+                                            debug_print(f"♻️ Rotating token and retrying (Attempt {attempt+2}/5)...")
+                                            await asyncio.sleep(2 + attempt)
+                                            current_headers = get_request_headers()
+                                            current_session_id = str(uuid7())
+                                            chunk_headers["Cookie"] = current_headers.get("Cookie")
+                                            # Rebuild payload with new session ID
+                                            payload = build_fake_history_payload(chunks, current_session_id)
+                                            if STICKY_SESSIONS:
+                                                sticky_session_ids[sticky_key] = {
+                                                    "session_id": current_session_id,
+                                                    "headers": current_headers
+                                                }
+                                            continue
+                                        raise HTTPException(status_code=response.status_code, detail=f"Upstream error: {response.status_code}")
+                                    
+                                    if response.status_code >= 400:
+                                        raise HTTPException(status_code=response.status_code, detail=f"Upstream error: {response.status_code}")
+                                    
+                                    # Stream the response
+                                    async for line in response.aiter_lines():
+                                        line = line.decode('utf-8').strip() if isinstance(line, bytes) else line.strip()
+                                        if not line: continue
+                                        
+                                        if line.startswith("a0:"):
+                                            chunk_data = line[3:]
+                                            try:
+                                                text_chunk = json.loads(chunk_data)
+                                                current_response_text += text_chunk
+                                                
+                                                chunk_response = {
+                                                    "id": chunk_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": model_public_name,
+                                                    "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}]
+                                                }
+                                                yield f"data: {fast_json_dumps(chunk_response)}\n\n"
+                                            except: pass
+                                        elif line.startswith("ad:"):
+                                            try:
+                                                metadata = json.loads(line[3:])
+                                                finish_reason = metadata.get("finishReason", "stop")
+                                                final_chunk = {
+                                                    "id": chunk_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": model_public_name,
+                                                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                                                }
+                                                yield f"data: {fast_json_dumps(final_chunk)}\n\n"
+                                            except: pass
+                                        elif line.startswith("a3:"):
+                                            error_data = line[3:]
+                                            try:
+                                                error_message = json.loads(error_data)
+                                                error_str = str(error_message).lower()
+                                                print(f"  ❌ Error in stream: {error_message}")
+                                                
+                                                # Check for rate limit errors
+                                                rate_limit_keywords = [
+                                                    "resource exhausted", "rate limit", "429", "too many requests",
+                                                    "quota exceeded", "capacity", "overloaded", "try again later"
+                                                ]
+                                                is_rate_limit = any(kw in error_str for kw in rate_limit_keywords)
+                                                
+                                                if is_rate_limit and attempt < 4:
+                                                    print(f"  🔄 Detected upstream rate limit! Will rotate token and retry...")
+                                                    raise UpstreamRateLimitError(error_message)
+                                                
+                                                error_chunk = {
+                                                    "error": {
+                                                        "message": str(error_message),
+                                                        "type": "api_error",
+                                                        "code": 500
+                                                    }
+                                                }
+                                                yield f"data: {fast_json_dumps(error_chunk)}\n\n"
+                                            except UpstreamRateLimitError:
+                                                raise
+                                            except: pass
+                                    
+                                    # Success - count tokens and finish
+                                    try:
+                                        enc = tiktoken.get_encoding("cl100k_base")
+                                        stream_tokens = len(enc.encode(current_response_text))
+                                        total_tokens_generated += stream_tokens
+                                        if model_public_name in model_usage_stats:
+                                            model_usage_stats[model_public_name]["tokens"] += stream_tokens
+                                        add_activity(model_public_name, stream_tokens, "success")
+                                        debug_print(f"✅ FAKE HISTORY stream complete | Tokens: {stream_tokens}")
+                                    except Exception:
+                                        est_tokens = len(current_response_text) // 4
+                                        total_tokens_generated += est_tokens
+                                        if model_public_name in model_usage_stats:
+                                            model_usage_stats[model_public_name]["tokens"] += est_tokens
+                                        add_activity(model_public_name, est_tokens, "success")
+                                        debug_print(f"✅ FAKE HISTORY stream complete | Tokens: ~{est_tokens}")
+                                    
+                                    yield "data: [DONE]\n\n"
+                                    debug_print(f"✅ Stream completed (FAKE HISTORY MODE)")
+                                    return  # Exit the generator
+                                    
+                            except UpstreamRateLimitError as e:
+                                print(f"⚠️ Upstream rate limit: {e}")
+                                if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                    del sticky_session_ids[sticky_key]
+                                retry_delay = 3 + attempt * 2
+                                debug_print(f"🔄 Rotating token and waiting {retry_delay}s (Attempt {attempt+2}/5)...")
+                                await asyncio.sleep(retry_delay)
+                                current_headers = get_request_headers()
+                                current_session_id = str(uuid7())
+                                chunk_headers["Cookie"] = current_headers.get("Cookie")
+                                payload = build_fake_history_payload(chunks, current_session_id)
+                                if STICKY_SESSIONS:
+                                    sticky_session_ids[sticky_key] = {
+                                        "session_id": current_session_id,
+                                        "headers": current_headers
+                                    }
+                                continue
+                            except (HTTPError, Timeout, RequestsError, ConnectionError) as e:
+                                print(f"❌ Stream error: {e}")
+                                if attempt < 4:
+                                    await asyncio.sleep(2)
+                                    current_headers = get_request_headers()
+                                    current_session_id = str(uuid7())
+                                    chunk_headers["Cookie"] = current_headers.get("Cookie")
+                                    payload = build_fake_history_payload(chunks, current_session_id)
+                                    continue
+                                error_chunk = {"error": {"message": f"Upstream error: {str(e)}", "type": "upstream_error", "code": 502}}
+                                yield f"data: {fast_json_dumps(error_chunk)}\n\n"
+                                return
+                        
+                        # If we exhausted all retries
+                        error_chunk = {"error": {"message": "All retry attempts failed", "type": "upstream_error", "code": 502}}
+                        yield f"data: {fast_json_dumps(error_chunk)}\n\n"
+                        return
+                    
+                    # ============================================================
+                    # LEGACY MODE - Sequential chunk sending (when FAKE_HISTORY_MODE is False or single chunk)
+                    # ============================================================
                     for i, chunk in enumerate(chunks):
                         # --- ROTATION LOGIC ---
                         is_new_session = False
@@ -7635,7 +8186,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                         "model": model_public_name,
                                                         "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}]
                                                     }
-                                                    yield f"data: {json.dumps(chunk_response)}\n\n"
+                                                    yield f"data: {fast_json_dumps(chunk_response)}\n\n"
                                                 except: pass
                                             elif line.startswith("ad:"):
                                                 try:
@@ -7648,13 +8199,27 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                         "model": model_public_name,
                                                         "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
                                                     }
-                                                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                                                    yield f"data: {fast_json_dumps(final_chunk)}\n\n"
                                                 except: pass
                                             elif line.startswith("a3:"):
                                                 error_data = line[3:]
                                                 try:
                                                     error_message = json.loads(error_data)
+                                                    error_str = str(error_message).lower()
                                                     print(f"  ❌ Error in stream: {error_message}")
+                                                    
+                                                    # Check if this is a rate limit / resource exhausted error
+                                                    rate_limit_keywords = [
+                                                        "resource exhausted", "rate limit", "429", "too many requests",
+                                                        "quota exceeded", "capacity", "overloaded", "try again later"
+                                                    ]
+                                                    is_rate_limit = any(kw in error_str for kw in rate_limit_keywords)
+                                                    
+                                                    if is_rate_limit and attempt < 4:
+                                                        print(f"  🔄 Detected upstream rate limit! Will rotate token and retry...")
+                                                        raise UpstreamRateLimitError(error_message)
+                                                    
+                                                    # Not a rate limit or out of retries - yield error to client
                                                     error_chunk = {
                                                         "error": {
                                                             "message": str(error_message),
@@ -7662,7 +8227,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                             "code": 500
                                                         }
                                                     }
-                                                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                                                    yield f"data: {fast_json_dumps(error_chunk)}\n\n"
+                                                except UpstreamRateLimitError:
+                                                    raise  # Re-raise to be caught by outer retry loop
                                                 except: pass
                                         
                                         # Update history (though not strictly needed for final chunk unless we want to save it)
@@ -7673,7 +8240,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         local_messages.append(model_msg)
                                         
                                         # Count tokens for streaming response
-                                        global total_tokens_generated
                                         try:
                                             enc = tiktoken.get_encoding("cl100k_base")
                                             stream_tokens = len(enc.encode(current_response_text))
@@ -7703,6 +8269,30 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 impersonate_target = "chrome120"
                                 continue # Retry immediately with new target
 
+                            except UpstreamRateLimitError as e:
+                                # Upstream provider (Google, OpenAI, etc.) hit rate limit
+                                print(f"⚠️ Upstream rate limit on Chunk {i+1}: {e}")
+                                
+                                if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                    debug_print(f"   Invalidating Sticky Session {current_session_id}...")
+                                    del sticky_session_ids[sticky_key]
+                                
+                                # Longer delay for upstream rate limits (they need time to reset)
+                                retry_delay = 3 + attempt * 2  # 3s, 5s, 7s, 9s
+                                debug_print(f"🔄 Rotating token and waiting {retry_delay}s before retry (Attempt {attempt+2}/5)...")
+                                await asyncio.sleep(retry_delay)
+                                
+                                current_headers = get_request_headers()
+                                current_session_id = str(uuid7())
+                                is_new_session = True
+                                
+                                if STICKY_SESSIONS:
+                                    sticky_session_ids[sticky_key] = {
+                                        "session_id": current_session_id,
+                                        "headers": current_headers
+                                    }
+                                continue  # Retry loop with new token
+                            
                             except (HTTPError, Timeout, RequestsError, ConnectionError) as e:
                                 print(f"❌ Stream error (curl_cffi): {str(e)}")
                                 
@@ -7732,7 +8322,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         "code": 502
                                     }
                                 }
-                                yield f"data: {json.dumps(error_chunk)}\n\n"
+                                yield f"data: {fast_json_dumps(error_chunk)}\n\n"
                                 debug_print(f"⛔ Chunk {i+1} failed after {attempt+1} attempts. Aborting stream.")
                                 return # Stop the stream completely to avoid sending a broken prompt
                             except Exception as e:
@@ -7744,7 +8334,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
 
                                     }
                                 }
-                                yield f"data: {json.dumps(error_chunk)}\n\n"
+                                yield f"data: {fast_json_dumps(error_chunk)}\n\n"
                                 break # Break retry loop
                 finally:
                     global active_generations
@@ -7777,10 +8367,198 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 current_headers = None
                 current_session_id = None
                 
+                # ============================================================
+                # FAKE HISTORY MODE (Non-Streaming) - Send all chunks in ONE request!
+                # ============================================================
+                if FAKE_HISTORY_MODE and total_chunks > 1:
+                    debug_print(f"📜 FAKE HISTORY MODE (Non-Stream): Bundling {total_chunks} chunks into single request")
+                    
+                    # Get headers and session
+                    sticky_key = f"{api_key_str}:{model_public_name}"
+                    if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                        data = sticky_session_ids[sticky_key]
+                        current_session_id = data["session_id"]
+                        current_headers = data["headers"]
+                        debug_print(f"📎 Reusing Sticky Session ID: {current_session_id}")
+                    else:
+                        current_headers = get_request_headers()
+                        current_session_id = str(uuid7())
+                        if STICKY_SESSIONS:
+                            sticky_session_ids[sticky_key] = {
+                                "session_id": current_session_id,
+                                "headers": current_headers
+                            }
+                        debug_print(f"📎 Created New Session ID: {current_session_id}")
+                    
+                    # Small thinking delay
+                    think_delay = random.uniform(0.5, 1.5)
+                    debug_print(f"🤔 Thinking delay: {think_delay:.2f}s")
+                    await asyncio.sleep(think_delay)
+                    
+                    # Build the fake history payload
+                    payload = build_fake_history_payload(chunks, current_session_id)
+                    
+                    # Prepare headers
+                    chunk_headers = {
+                        "Cookie": current_headers.get("Cookie"),
+                        "Content-Type": current_headers.get("Content-Type"),
+                        "Referer": current_headers.get("Referer"),
+                        "Origin": current_headers.get("Origin"),
+                    }
+                    chunk_headers = {k: v for k, v in chunk_headers.items() if v is not None}
+                    
+                    current_response_text = ""
+                    finish_reason = "stop"
+                    
+                    # Retry loop
+                    for attempt in range(5):
+                        try:
+                            debug_print(f"📡 Sending FAKE HISTORY POST request (attempt {attempt+1}/5)...")
+                            response = await client.post(url, json=payload, headers=chunk_headers, timeout=180)
+                            
+                            if response.status_code in [429, 401, 403, 400]:
+                                error_type = "Rate Limit" if response.status_code == 429 else "Auth/Bad Request Error"
+                                debug_print(f"⚠️ {response.status_code} ({error_type})")
+                                
+                                if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                    del sticky_session_ids[sticky_key]
+                                
+                                if attempt < 4:
+                                    debug_print(f"♻️ Rotating token and retrying (Attempt {attempt+2}/5)...")
+                                    await asyncio.sleep(2 + attempt)
+                                    current_headers = get_request_headers()
+                                    current_session_id = str(uuid7())
+                                    chunk_headers["Cookie"] = current_headers.get("Cookie")
+                                    payload = build_fake_history_payload(chunks, current_session_id)
+                                    if STICKY_SESSIONS:
+                                        sticky_session_ids[sticky_key] = {
+                                            "session_id": current_session_id,
+                                            "headers": current_headers
+                                        }
+                                    continue
+                            
+                            response.raise_for_status()
+                            
+                            # Parse response
+                            error_message = None
+                            for line in response.text.splitlines():
+                                line = line.strip()
+                                if not line: continue
+                                
+                                if line.startswith("a0:"):
+                                    try:
+                                        text_chunk = json.loads(line[3:])
+                                        current_response_text += text_chunk
+                                    except: pass
+                                elif line.startswith("a3:"):
+                                    try:
+                                        error_message = json.loads(line[3:])
+                                        error_str = str(error_message).lower()
+                                        
+                                        rate_limit_keywords = [
+                                            "resource exhausted", "rate limit", "429", "too many requests",
+                                            "quota exceeded", "capacity", "overloaded", "try again later"
+                                        ]
+                                        is_rate_limit = any(kw in error_str for kw in rate_limit_keywords)
+                                        
+                                        if is_rate_limit and attempt < 4:
+                                            print(f"  🔄 Detected upstream rate limit! Will rotate token and retry...")
+                                            raise UpstreamRateLimitError(error_message)
+                                    except UpstreamRateLimitError:
+                                        raise
+                                    except: 
+                                        error_message = line[3:]
+                                elif line.startswith("ad:"):
+                                    try:
+                                        metadata = json.loads(line[3:])
+                                        finish_reason = metadata.get("finishReason", "stop")
+                                    except: pass
+                            
+                            if not current_response_text and error_message:
+                                return {
+                                    "error": {
+                                        "message": f"Proxy error: {error_message}",
+                                        "type": "upstream_error",
+                                        "code": "lmarena_error"
+                                    }
+                                }
+                            
+                            # Success! Count tokens and return
+                            try:
+                                enc = tiktoken.get_encoding("cl100k_base")
+                                prompt_tokens = len(enc.encode(prompt))
+                                completion_tokens = len(enc.encode(current_response_text))
+                                total_tokens_generated += completion_tokens
+                                if model_public_name in model_usage_stats:
+                                    model_usage_stats[model_public_name]["tokens"] += completion_tokens
+                                add_activity(model_public_name, completion_tokens, "success")
+                                debug_print(f"✅ FAKE HISTORY response complete | Tokens: {completion_tokens}")
+                            except Exception:
+                                prompt_tokens = len(prompt) // 4
+                                completion_tokens = len(current_response_text) // 4
+                                total_tokens_generated += completion_tokens
+                                if model_public_name in model_usage_stats:
+                                    model_usage_stats[model_public_name]["tokens"] += completion_tokens
+                                add_activity(model_public_name, completion_tokens, "success")
+                            
+                            return {
+                                "id": f"chatcmpl-{uuid.uuid4()}",
+                                "object": "chat.completion",
+                                "created": int(time.time()),
+                                "model": model_public_name,
+                                "conversation_id": conversation_id,
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": current_response_text.strip(),
+                                    },
+                                    "finish_reason": finish_reason
+                                }],
+                                "usage": {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "total_tokens": prompt_tokens + completion_tokens
+                                }
+                            }
+                            
+                        except UpstreamRateLimitError as e:
+                            print(f"⚠️ Upstream rate limit: {e}")
+                            if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                del sticky_session_ids[sticky_key]
+                            retry_delay = 3 + attempt * 2
+                            await asyncio.sleep(retry_delay)
+                            current_headers = get_request_headers()
+                            current_session_id = str(uuid7())
+                            chunk_headers["Cookie"] = current_headers.get("Cookie")
+                            payload = build_fake_history_payload(chunks, current_session_id)
+                            if STICKY_SESSIONS:
+                                sticky_session_ids[sticky_key] = {
+                                    "session_id": current_session_id,
+                                    "headers": current_headers
+                                }
+                            continue
+                        except (HTTPError, Timeout, RequestsError, ConnectionError) as e:
+                            print(f"❌ Request error: {e}")
+                            if attempt < 4:
+                                await asyncio.sleep(2)
+                                current_headers = get_request_headers()
+                                current_session_id = str(uuid7())
+                                chunk_headers["Cookie"] = current_headers.get("Cookie")
+                                payload = build_fake_history_payload(chunks, current_session_id)
+                                continue
+                            return {"error": {"message": f"Upstream error: {str(e)}", "type": "upstream_error", "code": 502}}
+                    
+                    # Exhausted retries
+                    return {"error": {"message": "All retry attempts failed", "type": "upstream_error", "code": 502}}
+                
+                # ============================================================
+                # LEGACY MODE (Non-Streaming) - Sequential chunk sending
+                # ============================================================
                 for i, chunk in enumerate(chunks):
                     # --- ROTATION LOGIC ---
                     is_new_session = False
-                    if i % CHUNK_ROTATION_LIMIT == 0:
+                    if i % chunk_rotation_limit == 0:
                         debug_print(f"🔄 Batch Rotation: Switching to New Token & Session for Chunk {i+1}")
                         
                         # --- STICKY SESSION LOGIC ---
@@ -7915,7 +8693,22 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     error_data = line[3:]
                                     try:
                                         error_message = json.loads(error_data)
-                                    except: error_message = error_data
+                                        error_str = str(error_message).lower()
+                                        
+                                        # Check if this is a rate limit / resource exhausted error
+                                        rate_limit_keywords = [
+                                            "resource exhausted", "rate limit", "429", "too many requests",
+                                            "quota exceeded", "capacity", "overloaded", "try again later"
+                                        ]
+                                        is_rate_limit = any(kw in error_str for kw in rate_limit_keywords)
+                                        
+                                        if is_rate_limit and attempt < 4:
+                                            print(f"  🔄 Detected upstream rate limit in non-stream! Will rotate token and retry...")
+                                            raise UpstreamRateLimitError(error_message)
+                                    except UpstreamRateLimitError:
+                                        raise  # Re-raise to be caught by outer retry loop
+                                    except: 
+                                        error_message = error_data
                                 elif line.startswith("ad:"):
                                     try:
                                         metadata = json.loads(line[3:])
@@ -7947,7 +8740,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 }
 
                             # Count tokens using tiktoken (approximate with cl100k_base)
-                            global total_tokens_generated
                             try:
                                 enc = tiktoken.get_encoding("cl100k_base")
                                 prompt_tokens = len(enc.encode(prompt))
@@ -7994,6 +8786,30 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             debug_print("="*80 + "\n")
                             
                             return final_response
+                        
+                        except UpstreamRateLimitError as e:
+                            # Upstream provider (Google, OpenAI, etc.) hit rate limit
+                            print(f"⚠️ Upstream rate limit on Chunk {i+1}: {e}")
+                            
+                            if STICKY_SESSIONS and sticky_key in sticky_session_ids:
+                                debug_print(f"   Invalidating Sticky Session {current_session_id}...")
+                                del sticky_session_ids[sticky_key]
+                            
+                            # Longer delay for upstream rate limits
+                            retry_delay = 3 + attempt * 2  # 3s, 5s, 7s, 9s
+                            debug_print(f"🔄 Rotating token and waiting {retry_delay}s before retry (Attempt {attempt+2}/5)...")
+                            await asyncio.sleep(retry_delay)
+                            
+                            current_headers = get_request_headers()
+                            current_session_id = str(uuid7())
+                            is_new_session = True
+                            
+                            if STICKY_SESSIONS:
+                                sticky_session_ids[sticky_key] = {
+                                    "session_id": current_session_id,
+                                    "headers": current_headers
+                                }
+                            continue  # Retry loop with new token
                         
                         except (HTTPError, Timeout, RequestsError, ConnectionError) as e:
                             print(f"❌ Request error (curl_cffi): {str(e)}")
