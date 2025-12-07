@@ -678,11 +678,11 @@ def get_request_headers():
         raise HTTPException(status_code=500, detail="No arena auth tokens configured.")
     
     # Round-robin token selection - save index BEFORE incrementing for correct display
-    token_index_used = random.choice(range(len(auth_tokens)))
+    token_index_used = current_token_index % len(auth_tokens)
     token = auth_tokens[token_index_used]
-    current_token_index = token_index_used + 1
+    current_token_index = (current_token_index + 1) % len(auth_tokens)
 
-    sync_log(f"🔑 Using Token #{token_index_used + 1}/{len(auth_tokens)}")
+    sync_log(f"🔑 Using Token #{token_index_used + 1}/{len(auth_tokens)}", "DEBUG")
     
     # Use captured User-Agent or fallback
     user_agent = config.get("user_agent")
@@ -1159,12 +1159,16 @@ async def startup_event():
     save_models(get_models())
     # Load usage stats from config
     load_usage_stats()
+    # Load leaderboard cache
+    load_leaderboard_cache()
     # Log startup
     await add_log("🚀 LMArena Bridge starting up...", "INFO")
     await add_log(f"📍 Dashboard: http://localhost:{PORT}/dashboard", "INFO")
     await add_log(f"📚 API Base URL: http://localhost:{PORT}/v1", "INFO")
     # Start initial data fetch
     asyncio.create_task(get_initial_data())
+    # Update leaderboard in background
+    asyncio.create_task(update_leaderboard_on_startup())
     # Start periodic refresh task (every 30 minutes)
     asyncio.create_task(periodic_refresh_task())
     await add_log("✅ Startup complete", "SUCCESS")
